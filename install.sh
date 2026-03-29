@@ -127,6 +127,41 @@ L_UNKNOWN_CMD_HINT="  nmux help で使い方を確認してください。"
 L_TMUX_RELOAD_OK="tmux 設定をリロードしました"
 L_TMUX_RELOAD_FAIL="tmux リロードに失敗しました（手動: tmux source ~/.nmux/tmux.conf）"
 L_LOG_LABEL="ログ"
+L_HELP=$(cat <<'HELP'
+
+nmux — マルチエージェント tmux セットアップ (macOS / Ubuntu)
+
+使い方: nmux <コマンド> [オプション]
+
+コマンド:
+  install              インストール（モード・言語選択あり）
+  update               最新バージョンに更新
+  rollback             以前の tmux 設定を復元
+  uninstall            完全削除（PATH も自動クリーンアップ）
+  status               インストール状態を確認
+  heartbeat <subcmd>   ハートビート管理 (start/stop/status)
+  api [start|stop|status]  REST API サーバー管理（daemon モード用）
+  tui                  TUI ダッシュボードを起動
+  converse [opts]      AI-to-AI リアルタイム会話
+  verify <file> <sha>  ファイルの sha256 を検証
+  log [N]              直近 N 行のログを表示
+  version              バージョン表示
+  help                 このヘルプを表示
+
+環境変数:
+  NMUX_DEBUG=1         デバッグログを有効化
+
+ファイル:
+  ~/.nmux/nmux.conf        設定ファイル
+  ~/.nmux/tmux.conf        tmux 設定
+  ~/.nmux/bin/             CLI ツール群
+  ~/.nmux/backups/         設定バックアップ
+  ~/.nmux/logs/            操作ログ（日別）
+  ~/.nmux/state/           状態ファイル
+  ~/.nmux/skill-map.json   スキルマッピング
+
+HELP
+)
 
 # ============================================================
 # i18n — 言語ファイルのロード
@@ -996,8 +1031,8 @@ cmd_help() {
 # ============================================================
 load_conf 2>/dev/null || true
 
-# nmux.conf に NMUX_LANG が保存されていれば自動ロード
-if [ -n "${NMUX_LANG:-}" ] && [ "${NMUX_LANG}" != "ja" ]; then
+# nmux.conf に NMUX_LANG が保存されていれば自動ロード（ja も含め常にロード）
+if [ -n "${NMUX_LANG:-}" ]; then
   load_language "${NMUX_LANG}" 2>/dev/null || true
 fi
 
