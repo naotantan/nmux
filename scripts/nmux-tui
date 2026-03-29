@@ -298,6 +298,7 @@ class NmuxTUI:
         if not os.path.isfile(path):
             self._alert("ファイルが見つかりません: {}".format(path), error=True)
             return
+        r = None  # returncode 参照前に初期化しておく
         try:
             r = subprocess.run(
                 [DISPATCH, path],
@@ -307,8 +308,9 @@ class NmuxTUI:
         except subprocess.TimeoutExpired:
             msg = "dispatch タイムアウト"
         except Exception as exc:
+            _dbg("_run_dispatch: {}".format(exc))
             msg = "dispatch エラー: {}".format(exc)
-        self._alert(msg, error=(r.returncode != 0) if 'r' in dir() else True)
+        self._alert(msg, error=(r.returncode != 0) if r else True)
 
     def _alert(self, msg, error=False):
         """画面下部に一時メッセージを表示し、キー入力を待つ。"""
@@ -331,8 +333,8 @@ class NmuxTUI:
             return
         try:
             subprocess.run(["tmux", "select-pane", "-t", pane.get("pane_id", target)])
-        except Exception:
-            pass
+        except Exception as e:
+            _dbg("_select_pane: {}".format(e))
 
     # ── メインループ ─────────────────────────────────────────
     def run(self):
