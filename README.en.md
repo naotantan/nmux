@@ -42,11 +42,17 @@ You can run multiple agents on a single machine, operate remote agents via SSH, 
 curl -fsSL https://raw.githubusercontent.com/naotantan/nmux/main/install.sh | bash
 ```
 
-Choose a mode during installation:
+Choose a **language** and **mode** during installation:
 
 ```
-1) Standalone  — single machine only
-2) Cross-machine — main + sub machine (SSH)
+Select language:
+  1) 日本語
+  2) English
+  3) 中文（简体）
+
+Select installation mode:
+  1) Standalone     — single machine only
+  2) Cross-machine  — main + sub machine (SSH)
 ```
 
 If Python 3.6+ is available, nmux-dispatch / nmux-api / nmux-tui / nmux-converse are also installed automatically.
@@ -223,7 +229,7 @@ nmux-converse remove debate agent-b   # remove (minimum 2 required)
 
 ### Skill Auto-Detection (Feature A)
 
-Analyzes each message in real-time and displays the matching skill.
+Analyzes each message in real-time and automatically suggests the appropriate Claude Code skill (slash command). Ask for a code review and it detects `code-reviewer`; ask for research and it detects `research`.
 
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -277,7 +283,7 @@ Add a skill name to the `skip` array to disable notifications for it.
 
 ### Agent Auto-Scale (Feature B)
 
-Monitors timeouts, failures, and response load. Proposes adding agents when the score exceeds 5.
+Automatically monitors timeouts, failures, and response imbalance during conversation. When load increases, it shows a dialog: "Add more agents?" — approve and tmux panes are created and joined to the session on the spot.
 
 **Scoring logic:**
 
