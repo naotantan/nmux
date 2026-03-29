@@ -57,6 +57,23 @@ def _dbg(msg):
         print("[nmux-tui debug] {}".format(msg), file=sys.stderr)
 
 
+def _get_pane_content(pane_id, lines=20):
+    """tmux capture-pane で指定ペインの直近 N 行を取得し、ANSI エスケープを除去して返す。"""
+    if not pane_id or not _PANE_ID_RE.match(pane_id):
+        return []
+    try:
+        r = subprocess.run(
+            ["tmux", "capture-pane", "-t", pane_id, "-p", "-S", "-{}".format(lines)],
+            capture_output=True, text=True, timeout=2
+        )
+        if r.returncode == 0:
+            ansi_esc = re.compile(r'\x1b\[[0-9;]*[mKHJA-Za-z]|\x1b\(B')
+            return [ansi_esc.sub("", l).rstrip() for l in r.stdout.splitlines()]
+    except Exception as e:
+        _dbg("_get_pane_content({}): {}".format(pane_id, e))
+    return []
+
+
 def _get_panes():
     """nmux-bridge list --json でペイン情報を取得する。失敗は空リストを返す。"""
     try:
@@ -71,22 +88,68 @@ def _get_panes():
     return []
 
 
-def _get_last_line(pane_id):
-    """tmux capture-pane で直近1行を取得する（Read Guard を汚染しない）。"""
-    # pane_id が期待フォーマット（%N または session:window.pane）でなければスキップ
+# bash/zsh プロンプトや TUI アーティファクトとして無視するパターン
+_PROMPT_RE = re.compile(
+    r'^\s*[$%#>]\s*$'                        # 空プロンプト
+    r'|.*\[q\]\s*終了.*'                      # TUI フッター行
+    r'|.*\[q\]\s*Quit.*'                      # TUI フッター（英語）
+    r'|^\s*$'                                  # 空行
+    r'|^.*nmux_dashboard.*$'                   # TUI ヘッダー行
+    r'|^TARGET\s+LABEL.*$'                     # TUI カラムヘッダー
+    r'|^[─━─]+$'                              # TUI 区切り線
+)
+
+# AI プロセスとして認識するプロセス名
+_AI_PROCS = {"claude", "python3", "python", "node", "ollama", "llm"}
+
+
+def _get_last_output(pane_id):
+    """tmux capture-pane で直近30行を取得し、意味のある最終行を返す。
+    bash プロンプト・空行・TUI アーティファクトを除外する。
+    """
     if not pane_id or not _PANE_ID_RE.match(pane_id):
-        return "✗ OFFLINE"
+        return "✗ OFFLINE", False
+
     try:
         r = subprocess.run(
-            ["tmux", "capture-pane", "-t", pane_id, "-p", "-S", "-1"],
+            ["tmux", "capture-pane", "-t", pane_id, "-p", "-S", "-30"],
             capture_output=True, text=True, timeout=2
         )
-        if r.returncode == 0:
-            lines = [l for l in r.stdout.splitlines() if l.strip()]
-            return lines[-1] if lines else ""
+        if r.returncode != 0:
+            return "✗ OFFLINE", False
+
+        # ANSI エスケープを除去してから判定
+        ansi_esc = re.compile(r'\x1b\[[0-9;]*[mKHJA-Za-z]|\x1b\(B')
+        lines = [ansi_esc.sub("", l) for l in r.stdout.splitlines()]
+        # 意味のある行だけ残す
+        meaningful = [l.rstrip() for l in lines if l.strip() and not _PROMPT_RE.match(l)]
+        if meaningful:
+            return meaningful[-1], False
+        return "（待機中）", False
+
     except Exception as e:
-        _dbg("_get_last_line({}): {}".format(pane_id, e))
-    return "✗ OFFLINE"
+        _dbg("_get_last_output({}): {}".format(pane_id, e))
+    return "✗ OFFLINE", False
+
+
+def _get_agent_status(process, last_output):
+    """プロセス名と直近出力からエージェントのステータスを返す。
+
+    Returns:
+        tuple: (status_str, color_pair_id)
+            status_str: 表示文字列（最大7文字）
+            is_ai: AI プロセスかどうか
+    """
+    proc_lower = (process or "").lower().split("/")[-1]  # パスの basename
+    is_ai = proc_lower in _AI_PROCS
+
+    if "✗ OFFLINE" in last_output:
+        return "OFFLINE", _C_OFFLINE, False
+    if is_ai:
+        return "AI稼働", _C_ONLINE, True
+    if last_output == "（待機中）":
+        return "待機中", _C_LABEL, False
+    return "稼働中", _C_ONLINE, False
 
 
 def _check_api():
@@ -161,18 +224,22 @@ class NmuxTUI:
         """ペインごとの表示文字列を返す。curses に依存しない純粋メソッド。
 
         Returns:
-            list of dict: {target, label, process, last, offline}
+            list of dict: {target, label, status, status_color, is_ai, last, offline}
         """
         rows = []
         for pane in self.panes:
-            last    = _truncate(_get_last_line(pane.get("pane_id", "")),
-                                col_widths["out"])
+            last_raw, _ = _get_last_output(pane.get("pane_id", ""))
+            process     = pane.get("process", "")
+            status_str, status_color, is_ai = _get_agent_status(process, last_raw)
+            last        = _truncate(last_raw, col_widths["out"])
             rows.append({
-                "target":  _truncate(pane.get("target",  ""), col_widths["target"]),
-                "label":   _truncate(pane.get("label",   ""), col_widths["label"]),
-                "process": _truncate(pane.get("process", ""), col_widths["process"]),
-                "last":    last,
-                "offline": "OFFLINE" in last or "✗" in last,
+                "target":       _truncate(pane.get("target", ""),  col_widths["target"]),
+                "label":        _truncate(pane.get("label",  ""),  col_widths["label"]),
+                "status":       "{:<{}}".format(status_str, col_widths["status"]),
+                "status_color": status_color,
+                "is_ai":        is_ai,
+                "last":         last,
+                "offline":      "OFFLINE" in last_raw or "✗" in last_raw,
             })
         return rows
 
@@ -202,24 +269,35 @@ class NmuxTUI:
         fill = max(0, max_x - x)
         _safe_addstr(self.scr, 0, x, " " * fill, curses.color_pair(_C_HEADER))
 
+        # ── エージェント集計（ヘッダー右端に表示） ──────────────
+        # （_build_pane_rows 前に軽量集計: bridge データのみ使用）
+        total  = len(self.panes)
+        active = sum(
+            1 for p in self.panes
+            if (p.get("process", "").lower().split("/")[-1] in _AI_PROCS)
+        )
+        agent_summary = " agents: {}/{}".format(active, total)
+        _safe_addstr(self.scr, 0, max(0, max_x - len(agent_summary) - 2),
+                     agent_summary[:max_x], curses.color_pair(_C_HEADER))
+
         # ── カラムヘッダー ──────────────────────────────────
-        col_w = {"target": 14, "label": 10, "process": 10}
-        out_w = max(10, max_x - col_w["target"] - col_w["label"] - col_w["process"] - 4)
+        col_w = {"target": 14, "label": 10, "status": 8}
+        out_w = max(10, max_x - col_w["target"] - col_w["label"] - col_w["status"] - 4)
         fmt   = "{:<{}} {:<{}} {:<{}} {:<{}}".format(
             "TARGET",  col_w["target"],
             "LABEL",   col_w["label"],
-            "PROCESS", col_w["process"],
+            "STATUS",  col_w["status"],
             "LAST OUTPUT", out_w,
         )
         _safe_addstr(self.scr, 1, 0, fmt[:max_x], curses.A_BOLD)
 
         # 区切り線
-        line = "─" * min(max_x, col_w["target"] + col_w["label"] + col_w["process"] + out_w + 3)
+        line = "─" * min(max_x, col_w["target"] + col_w["label"] + col_w["status"] + out_w + 3)
         _safe_addstr(self.scr, 2, 0, line, curses.color_pair(_C_BORDER))
 
         # ── ペイン行（_build_pane_rows で構築したデータを描画） ─
         col_widths = {"target": col_w["target"], "label": col_w["label"],
-                      "process": col_w["process"], "out": out_w}
+                      "status": col_w["status"], "out": out_w}
         pane_rows = self._build_pane_rows(col_widths)
         for idx, prow in enumerate(pane_rows):
             row = idx + 3
@@ -234,13 +312,58 @@ class NmuxTUI:
                 "{:<{}}".format(prow["label"], col_w["label"])[:max(0, max_x - col)],
                 attr | curses.color_pair(_C_LABEL))
             col += col_w["label"] + 1
+            # STATUS: 色付き
+            status_attr = curses.color_pair(prow["status_color"])
+            if prow["is_ai"]:
+                status_attr |= curses.A_BOLD
             _safe_addstr(self.scr, row, col,
-                "{:<{}}".format(prow["process"], col_w["process"])[:max(0, max_x - col)], attr)
-            col += col_w["process"] + 1
-            out_attr = curses.color_pair(_C_OFFLINE) if prow["offline"] else curses.color_pair(_C_ONLINE)
+                prow["status"][:max(0, max_x - col)],
+                attr | status_attr)
+            col += col_w["status"] + 1
+            # LAST OUTPUT: OFFLINE=赤 / 待機中=暗め / その他=緑
+            if prow["offline"]:
+                out_attr = curses.color_pair(_C_OFFLINE)
+            elif "待機中" in prow["last"]:
+                out_attr = curses.color_pair(_C_KEY)
+            else:
+                out_attr = curses.color_pair(_C_ONLINE)
             _safe_addstr(self.scr, row, col,
                 "{:<{}}".format(prow["last"], out_w)[:max(0, max_x - col)],
                 attr | out_attr)
+
+        # ── 会話ビュー（選択エージェントの直近出力） ──────────
+        # エージェント行数: pane_rows の数 + ヘッダー3行
+        list_end_row = len(pane_rows) + 3
+        # 会話ビューに使える行数（フッター2行を除く）
+        conv_available = max_y - list_end_row - 2
+        if conv_available >= 4 and self.panes:
+            sel_pane  = self.panes[min(self.cursor, len(self.panes) - 1)]
+            sel_label = sel_pane.get("label", sel_pane.get("target", "?"))
+            pane_id   = sel_pane.get("pane_id", "")
+
+            # 区切り線 + セクションタイトル
+            div_y = list_end_row
+            div_line = "─" * min(max_x, 60)
+            _safe_addstr(self.scr, div_y, 0, div_line, curses.color_pair(_C_BORDER))
+            title = " 📺 {} — 直近の出力 ".format(sel_label)
+            _safe_addstr(self.scr, div_y, 2, title[:max_x - 2], curses.A_BOLD)
+
+            # ペイン内容を取得（表示行数分）
+            content_lines = _get_pane_content(pane_id, lines=conv_available)
+            # 末尾 conv_available 行だけ使う
+            content_lines = content_lines[-conv_available:]
+            for ci, cline in enumerate(content_lines):
+                cy = div_y + 1 + ci
+                if cy >= max_y - 1:
+                    break
+                # [FROM→TO] パターンを含む行はハイライト（エージェント間メッセージ）
+                is_msg = bool(re.search(r'\[.*→.*\]|\[nmux\]', cline))
+                cattr  = (curses.color_pair(_C_LABEL) | curses.A_BOLD) if is_msg \
+                         else curses.color_pair(_C_ONLINE) if cline.strip() \
+                         else 0
+                _safe_addstr(self.scr, cy, 0,
+                    _truncate(cline, max_x).ljust(min(max_x, len(cline) + 1))[:max_x],
+                    cattr)
 
         # ── フッター（キー一覧） ────────────────────────────
         footer_y = max_y - 1
