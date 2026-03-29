@@ -407,7 +407,11 @@ _recommend_scale_up() {
 # #3: tmpfile を使わずパイプで処理（軽量化）
 # #3: 同一メッセージが複数回出現する場合、最後のマッチ以降を使用する
 _extract_response() {
-  printf '%s\n' "$1" | awk -v msg="$2" '
+  # $2（送信メッセージ）に絵文字・改行が含まれると awk -v が "newline in string" で失敗する
+  # → 先頭1行・50文字のみ抽出してキーとして使用する
+  local msg_key
+  msg_key=$(printf '%s' "$2" | head -1 | cut -c1-50)
+  printf '%s\n' "$1" | awk -v msg="$msg_key" '
     BEGIN { n=0; last_match=0 }
     index($0, msg) { last_match=NR; next }
     { buf[NR]=$0 }

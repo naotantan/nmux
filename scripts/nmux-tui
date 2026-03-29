@@ -25,14 +25,15 @@ _INTERVAL_SMALL = 1   # ≤20 ペイン: 1秒
 _INTERVAL_LARGE = 3   # >20 ペイン: 3秒
 
 # カラーペア番号
-_C_HEADER  = 1   # ヘッダー行（青背景）
-_C_BORDER  = 2   # 枠線（シアン）
-_C_ONLINE  = 3   # オンライン（緑）
-_C_OFFLINE = 4   # オフライン（赤）
-_C_LABEL   = 5   # ラベル（黄色）
-_C_KEY     = 6   # キー表示（白太字）
-_C_API_ON  = 7   # API オン（緑）
-_C_API_OFF = 8   # API オフ（赤）
+_C_HEADER   = 1   # ヘッダー行（青背景）
+_C_BORDER   = 2   # 枠線（シアン）
+_C_ONLINE   = 3   # オンライン（緑）
+_C_OFFLINE  = 4   # オフライン（赤）
+_C_LABEL    = 5   # ラベル（黄色）
+_C_KEY      = 6   # キー表示（白太字）
+_C_API_ON   = 7   # API オン（緑）
+_C_API_OFF  = 8   # API オフ（赤）
+_C_CONVERSE = 9   # converse ヘッダー（マゼンタ）
 
 
 # ── ユーティリティ ─────────────────────────────────────────────
@@ -152,6 +153,102 @@ def _get_agent_status(process, last_output):
     return "稼働中", _C_ONLINE, False
 
 
+def _get_converse_sessions():
+    """~/.nmux/state/converse/*.conf を読んでセッション情報を返す。
+    STATUS が "running" のものを優先し、全セッションをリストで返す。
+
+    Returns:
+        list of dict: {name, agents, topic, status, started, log_path}
+    """
+    converse_dir = os.path.join(STATE_DIR, "converse")
+    if not os.path.isdir(converse_dir):
+        return []
+    sessions = []
+    try:
+        for fname in sorted(os.listdir(converse_dir)):
+            if not fname.endswith(".conf"):
+                continue
+            conf_path = os.path.join(converse_dir, fname)
+            data = {}
+            try:
+                with open(conf_path, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if "=" in line:
+                            k, v = line.split("=", 1)
+                            data[k] = v.strip('"').strip("'")
+            except OSError:
+                continue
+            name = data.get("NAME", fname[:-5])
+            sessions.append({
+                "name":     name,
+                "agents":   data.get("AGENTS", "").split(),
+                "topic":    data.get("TOPIC", ""),
+                "status":   data.get("STATUS", ""),
+                "started":  data.get("STARTED", ""),
+                "log_path": os.path.join(converse_dir, name + ".log"),
+            })
+    except OSError as e:
+        _dbg("_get_converse_sessions: {}".format(e))
+    # running セッションを先に
+    sessions.sort(key=lambda s: (0 if s["status"] == "running" else 1, s["name"]))
+    return sessions
+
+
+def _get_converse_log_info(log_path, max_exchanges=5):
+    """converse ログを解析して会話情報を返す。
+
+    Returns:
+        dict: {
+            "exchanges": list of (speaker, text),  # 直近の発言
+            "current_turn": int,   # 直近ターン番号（0=不明）
+            "total_turns":  int,   # 総ターン数（0=不明）
+            "next_agent":   str,   # 次の発言予定エージェント（""=不明）
+        }
+    """
+    result = {"exchanges": [], "current_turn": 0, "total_turns": 0, "next_agent": ""}
+    if not os.path.isfile(log_path):
+        return result
+
+    ansi_esc  = re.compile(r'\x1b\[[0-9;]*[mKHJA-Za-z]|\x1b\(B|\x1b[()][AB012]')
+    turn_re   = re.compile(r'\[Turn\s+(\d+)/(\d+)\].*?→\s*(\S+)')
+    speaker_re = re.compile(r'^\[([^\]]+)\]\s*(.*)')
+
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as f:
+            raw_lines = f.readlines()[-300:]
+    except OSError:
+        return result
+
+    exchanges = []
+    for line in raw_lines:
+        clean = ansi_esc.sub("", line).rstrip()
+        if not clean:
+            continue
+        # ターン情報の抽出
+        tm = turn_re.search(clean)
+        if tm:
+            result["current_turn"] = int(tm.group(1))
+            result["total_turns"]  = int(tm.group(2))
+            result["next_agent"]   = tm.group(3)
+            continue
+        # エージェント発言の抽出
+        sm = speaker_re.match(clean)
+        if sm:
+            speaker = sm.group(1)
+            text    = sm.group(2).strip()
+            # [Turn N/M] タイプやタイムスタンプ行をスキップ
+            if re.match(r'^Turn\s+\d+', speaker):
+                continue
+            if re.match(r'\d{4}-', text) or text.startswith("to:"):
+                continue
+            if text and not re.match(r'^(TIMEOUT|SKIP)', text):
+                exchanges.append((speaker, text))
+
+    result["exchanges"] = exchanges[-max_exchanges:]
+    return result
+
+
 def _check_api():
     """API サーバーの稼働状況を PID ファイルで確認する。"""
     pid_file = os.path.join(STATE_DIR, "api.pid")
@@ -203,8 +300,9 @@ class NmuxTUI:
         curses.init_pair(_C_OFFLINE, curses.COLOR_RED,    -1)
         curses.init_pair(_C_LABEL,   curses.COLOR_YELLOW, -1)
         curses.init_pair(_C_KEY,     curses.COLOR_WHITE,  -1)
-        curses.init_pair(_C_API_ON,  curses.COLOR_GREEN,  -1)
-        curses.init_pair(_C_API_OFF, curses.COLOR_RED,    -1)
+        curses.init_pair(_C_API_ON,   curses.COLOR_GREEN,   -1)
+        curses.init_pair(_C_API_OFF,  curses.COLOR_RED,     -1)
+        curses.init_pair(_C_CONVERSE, curses.COLOR_MAGENTA, -1)
 
         curses.cbreak()
         curses.noecho()
@@ -269,14 +367,17 @@ class NmuxTUI:
         fill = max(0, max_x - x)
         _safe_addstr(self.scr, 0, x, " " * fill, curses.color_pair(_C_HEADER))
 
-        # ── エージェント集計（ヘッダー右端に表示） ──────────────
-        # （_build_pane_rows 前に軽量集計: bridge データのみ使用）
+        # ── エージェント集計 + converse稼働数（ヘッダー右端に表示） ──────
         total  = len(self.panes)
         active = sum(
             1 for p in self.panes
             if (p.get("process", "").lower().split("/")[-1] in _AI_PROCS)
         )
-        agent_summary = " AI稼働: {}/{} エージェント".format(active, total)
+        running_conv_count = sum(
+            1 for s in _get_converse_sessions() if s["status"] == "running"
+        )
+        conv_part = "  会話: {}件".format(running_conv_count) if running_conv_count else ""
+        agent_summary = " AI稼働: {}/{}{}".format(active, total, conv_part)
         _safe_addstr(self.scr, 0, max(0, max_x - len(agent_summary) - 2),
                      agent_summary[:max_x], curses.color_pair(_C_HEADER))
 
@@ -331,44 +432,122 @@ class NmuxTUI:
                 "{:<{}}".format(prow["last"], out_w)[:max(0, max_x - col)],
                 attr | out_attr)
 
-        # ── 会話ビュー（選択エージェントの直近出力） ──────────
-        # エージェント行数: pane_rows の数 + ヘッダー3行
+        # ── 下部パネル（会話ビュー / converse リアルタイム表示） ──
+        # ペイン行数 + ヘッダー3行 = 下部パネルの開始行
         list_end_row = len(pane_rows) + 3
-        # 会話ビューに使える行数（フッター2行を除く）
-        conv_available = max_y - list_end_row - 2
-        if conv_available >= 4 and self.panes:
-            sel_pane  = self.panes[min(self.cursor, len(self.panes) - 1)]
-            sel_label = sel_pane.get("label", sel_pane.get("target", "?"))
-            pane_id   = sel_pane.get("pane_id", "")
+        # フッター1行を確保した上での利用可能行数
+        lower_available = max_y - list_end_row - 1
 
-            # 区切り線 + セクションタイトル
-            div_y = list_end_row
+        if lower_available >= 4:
+            div_y    = list_end_row
             div_line = "─" * min(max_x, 60)
-            _safe_addstr(self.scr, div_y, 0, div_line, curses.color_pair(_C_BORDER))
-            title = " 📺 {} — 直近の出力 ".format(sel_label)
-            _safe_addstr(self.scr, div_y, 2, title[:max_x - 2], curses.A_BOLD)
 
-            # ペイン内容を取得（表示行数分）
-            content_lines = _get_pane_content(pane_id, lines=conv_available)
-            # 末尾 conv_available 行だけ使う
-            content_lines = content_lines[-conv_available:]
-            for ci, cline in enumerate(content_lines):
-                cy = div_y + 1 + ci
-                if cy >= max_y - 1:
-                    break
-                # [FROM→TO] パターンを含む行はハイライト（エージェント間メッセージ）
-                is_msg = bool(re.search(r'\[.*→.*\]|\[nmux\]', cline))
-                cattr  = (curses.color_pair(_C_LABEL) | curses.A_BOLD) if is_msg \
-                         else curses.color_pair(_C_ONLINE) if cline.strip() \
-                         else 0
-                _safe_addstr(self.scr, cy, 0,
-                    _truncate(cline, max_x).ljust(min(max_x, len(cline) + 1))[:max_x],
-                    cattr)
+            # ── アクティブな converse セッションがあれば優先表示 ──
+            conv_sessions    = _get_converse_sessions()
+            running_sessions = [s for s in conv_sessions if s["status"] == "running"]
+
+            if running_sessions:
+                # running セッションを最大2つ表示（各セッションに行を均等分配）
+                slots    = min(len(running_sessions), 2)
+                rows_per = max(4, lower_available // slots)
+
+                # エージェントごとに色を割り当てるカラーサイクル
+                agent_colors = [_C_CONVERSE, _C_LABEL, _C_ONLINE, _C_BORDER]
+
+                cur_y = div_y
+                for si, sess in enumerate(running_sessions[:slots]):
+                    if cur_y >= max_y - 1:
+                        break
+
+                    # ── セッションヘッダー ──
+                    agents_str  = " ⟷ ".join(sess["agents"]) if sess["agents"] else "?"
+                    topic_short = _truncate(sess["topic"], max(0, max_x - len(agents_str) - 20))
+                    _safe_addstr(self.scr, cur_y, 0,
+                        div_line, curses.color_pair(_C_BORDER))
+
+                    log_info = _get_converse_log_info(sess["log_path"], max_exchanges=rows_per - 2)
+                    turn_s   = ""
+                    if log_info["total_turns"] > 0:
+                        turn_s = "  Turn {}/{}".format(
+                            log_info["current_turn"], log_info["total_turns"])
+                    next_s = ""
+                    if log_info["next_agent"]:
+                        next_s = "  → {}".format(log_info["next_agent"])
+
+                    # セッションヘッダーバー（背景色付き・全幅）
+                    sess_title = " ● 会話中: {}  [{}]{}{}  {}".format(
+                        sess["name"], agents_str, turn_s, next_s, topic_short)
+                    # 全幅を背景色で埋めてからテキストを上書き
+                    _safe_addstr(self.scr, cur_y, 0,
+                        " " * max_x,
+                        curses.color_pair(_C_HEADER))
+                    _safe_addstr(self.scr, cur_y, 0,
+                        sess_title[:max_x],
+                        curses.color_pair(_C_HEADER) | curses.A_BOLD)
+                    cur_y += 1
+
+                    # ── 会話ログ（発話ごとに整列・色分け） ──
+                    # 最長話者名を算出して列幅を揃える
+                    max_spk_len = max(
+                        (len(sp) for sp, _ in log_info["exchanges"]), default=8)
+                    max_spk_len = min(max_spk_len, 12)
+
+                    agent_color_map = {}
+                    color_idx = 0
+                    for (speaker, text) in log_info["exchanges"]:
+                        if cur_y >= max_y - 1:
+                            break
+                        # 発話者ごとに固定色を割り当て
+                        if speaker not in agent_color_map:
+                            agent_color_map[speaker] = agent_colors[
+                                color_idx % len(agent_colors)]
+                            color_idx += 1
+                        lattr  = curses.color_pair(agent_color_map[speaker]) | curses.A_BOLD
+                        # "▶ speaker-name : text" 形式で発話者を固定幅に揃える
+                        label  = "  ▶ {:<{}} ".format(
+                            _truncate(speaker, max_spk_len), max_spk_len)
+                        line   = label + _truncate(
+                            text, max(0, max_x - len(label) - 1))
+                        # 話者名部分と本文で色を分ける
+                        _safe_addstr(self.scr, cur_y, 0, label[:max_x], lattr)
+                        if len(label) < max_x:
+                            _safe_addstr(self.scr, cur_y, len(label),
+                                _truncate(text, max(0, max_x - len(label)))[:max(0, max_x - len(label))],
+                                curses.color_pair(_C_KEY))
+                        cur_y += 1
+
+            elif self.panes:
+                # converse が動いていなければ選択ペインの直近出力を表示（既来の挙動）
+                sel_pane  = self.panes[min(self.cursor, len(self.panes) - 1)]
+                sel_label = sel_pane.get("label", sel_pane.get("target", "?"))
+                pane_id   = sel_pane.get("pane_id", "")
+
+                _safe_addstr(self.scr, div_y, 0, div_line, curses.color_pair(_C_BORDER))
+                title = " 📺 {} — 直近の出力 ".format(sel_label)
+                _safe_addstr(self.scr, div_y, 2, title[:max_x - 2], curses.A_BOLD)
+
+                content_lines = _get_pane_content(pane_id, lines=lower_available)
+                content_lines = content_lines[-(lower_available - 1):]
+                for ci, cline in enumerate(content_lines):
+                    cy = div_y + 1 + ci
+                    if cy >= max_y - 1:
+                        break
+                    is_msg = bool(re.search(r'\[.*→.*\]|\[nmux\]', cline))
+                    cattr  = (curses.color_pair(_C_LABEL) | curses.A_BOLD) if is_msg \
+                             else curses.color_pair(_C_ONLINE) if cline.strip() \
+                             else 0
+                    _safe_addstr(self.scr, cy, 0,
+                        _truncate(cline, max_x).ljust(min(max_x, len(cline) + 1))[:max_x],
+                        cattr)
 
         # ── フッター（キー一覧） ────────────────────────────
         footer_y = max_y - 1
-        keys = "  [q] 終了  [r] 画面更新  [Enter] このペインへ移動  [d] タスク一括送信  " \
-               "[↑↓] 移動  更新間隔: {}s".format(self.interval)
+        conv_sessions_active = any(
+            s["status"] == "running" for s in _get_converse_sessions()
+        )
+        stop_key = "  [s] 会話停止" if conv_sessions_active else ""
+        keys = "  [q] 終了  [r] 即時更新  [Enter] このペインへ移動  [d] タスク一括送信  " \
+               "[↑↓] 移動{}  ● 自動更新: {}s".format(stop_key, self.interval)
         _safe_addstr(self.scr, footer_y, 0,
             keys[:max_x], curses.color_pair(_C_KEY))
 
@@ -446,6 +625,36 @@ class NmuxTUI:
         self.scr.getch()
         self.scr.timeout(100)
 
+    # ── converse 停止ダイアログ ───────────────────────────────
+    def _stop_converse_dialog(self):
+        """実行中の converse セッションを選択・停止する。"""
+        running = [s for s in _get_converse_sessions() if s["status"] == "running"]
+        if not running:
+            self._alert("実行中の会話セッションはありません")
+            return
+
+        if len(running) == 1:
+            name = running[0]["name"]
+        else:
+            # 複数ある場合はセッション名を入力させる
+            names = ", ".join(s["name"] for s in running)
+            prompt = " 停止するセッション名を入力 ({}):  ".format(names)
+            name = self._get_user_input(prompt).strip()
+            if not name:
+                return
+
+        converse_bin = os.path.join(BIN_DIR, "nmux-converse")
+        try:
+            r = subprocess.run(
+                [converse_bin, "stop", name],
+                capture_output=True, text=True, timeout=10
+            )
+            msg = "会話 '{}' を停止しました".format(name) \
+                  if r.returncode == 0 else "停止失敗: {}".format(r.stderr.strip()[:60])
+        except Exception as e:
+            msg = "エラー: {}".format(e)
+        self._alert(msg, error=(msg.startswith("停止失敗") or msg.startswith("エラー")))
+
     # ── ペイン選択（Enter） ──────────────────────────────────
     def _select_pane(self):
         if not self.panes:
@@ -504,6 +713,10 @@ class NmuxTUI:
             elif key in (ord("d"), ord("D")):
                 self._dispatch_dialog()
                 last_refresh = 0  # 操作後に即更新
+
+            elif key in (ord("s"), ord("S")):
+                self._stop_converse_dialog()
+                last_refresh = 0
 
 
 # ── エントリーポイント ─────────────────────────────────────────
