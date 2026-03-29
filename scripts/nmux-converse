@@ -594,6 +594,52 @@ _run_loop() {
   fi
 }
 
+# ── API トークン確認（未設定の場合に警告）────────────────────
+# Claude Code のログイン状態 or ANTHROPIC_API_KEY の存在を確認する
+_check_api_token_warn() {
+  # すでに確認済みならスキップ
+  [ "${NMUX_API_TOKEN_CHECKED:-0}" = "1" ] && return 0
+
+  local has_auth=0
+
+  # 1. ANTHROPIC_API_KEY の確認
+  if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+    case "${ANTHROPIC_API_KEY}" in
+      sk-ant-*)
+        has_auth=1
+        ;;
+      your-api-key*|YOUR_API_KEY*|placeholder*|PLACEHOLDER*|xxx*|XXX*)
+        _warn "ANTHROPIC_API_KEY がプレースホルダーです。有効な API キーを設定してください。"
+        ;;
+      *)
+        # 形式が異なっても claude login 済みの可能性があるため警告のみ
+        has_auth=1
+        ;;
+    esac
+  fi
+
+  # 2. ~/.claude/.credentials や oauth トークンの確認
+  if [ -f "${HOME}/.claude/.credentials" ] || \
+     [ -f "${HOME}/.config/claude/credentials.json" ] || \
+     [ -f "${HOME}/Library/Application Support/Claude/credentials.json" ] 2>/dev/null; then
+    has_auth=1
+  fi
+
+  # 3. 未認証の場合に警告（続行は可能）
+  if [ "${has_auth}" = "0" ]; then
+    _warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    _warn "API キーまたは claude ログインが確認できません。"
+    _warn "エージェントが応答しない場合は以下を確認してください:"
+    _warn "  方法1: claude login  （Claude Code でログイン）"
+    _warn "  方法2: export ANTHROPIC_API_KEY=\"sk-ant-...\"  （API キーを設定）"
+    _warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+  fi
+
+  # 一度チェックしたらフラグを立てて重複警告を防ぐ
+  NMUX_API_TOKEN_CHECKED=1
+  export NMUX_API_TOKEN_CHECKED
+}
+
 # ============================================================
 # cmd_start
 # ============================================================
@@ -630,6 +676,9 @@ cmd_start() {
     _err "エージェントを2つ以上指定してください\n  例: nmux-converse agent-a agent-b \"テーマ\""
   [ -z "${message}" ] && \
     _err "トピックを指定してください: -m \"<テーマ>\""
+
+  # API トークン / 認証チェック（未設定の場合は警告を表示）
+  _check_api_token_warn
 
   [ -z "${name}" ] && name="sess-$(date +%H%M%S)"
 

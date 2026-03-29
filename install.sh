@@ -4,7 +4,7 @@
 # https://github.com/naotantan/nmux
 set -euo pipefail
 
-NMUX_VERSION="2.0.0"
+NMUX_VERSION="2.1.0"
 REPO_OWNER="naotantan"
 REPO_NAME="nmux"
 BRANCH="main"
@@ -135,6 +135,7 @@ nmux — マルチエージェント tmux セットアップ (macOS / Ubuntu)
 
 コマンド:
   install              インストール（モード・言語選択あり）
+  init                 初回セットアップウィザード（インストール後に実行）
   update               最新バージョンに更新
   rollback             以前の tmux 設定を復元
   uninstall            完全削除（PATH も自動クリーンアップ）
@@ -679,6 +680,11 @@ install_core() {
   download "${BASE_URL}/scripts/nmux-converse" "${BIN_DIR}/nmux-converse"
   chmod +x "${BIN_DIR}/nmux-converse"
 
+  # nmux-init（セットアップウィザード）
+  info "$(printf "${L_INSTALLING}" "nmux-init")"
+  download "${BASE_URL}/scripts/nmux-init" "${BIN_DIR}/nmux-init"
+  chmod +x "${BIN_DIR}/nmux-init"
+
   # skill-map.json（既存は上書きしない）
   if [ ! -f "${NMUX_DIR}/skill-map.json" ]; then
     download "${BASE_URL}/scripts/skill-map.json" "${NMUX_DIR}/skill-map.json"
@@ -1044,6 +1050,7 @@ case "${1:-install}" in
   status)             cmd_status ;;
   heartbeat)          shift; cmd_heartbeat "$@" ;;
   api)                shift; "${BIN_DIR}/nmux-api" "${1:-status}" ;;
+  init)               "${BIN_DIR}/nmux-init" ;;
   tui)                "${BIN_DIR}/nmux-tui" ;;
   converse)           shift; "${BIN_DIR}/nmux-converse" "$@" ;;
   verify)             cmd_verify "${2:-}" "${3:-}" ;;

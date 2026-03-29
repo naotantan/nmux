@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# nmux-init — インタラクティブ初回セットアップウィザード
+# 初めて nmux を使うユーザーを tmux ペイン設定まで案内する
+# https://github.com/naotantan/nmux
+set -euo pipefail
+
+NMUX_DIR="${HOME}/.nmux"
+BIN_DIR="${NMUX_DIR}/bin"
+BRIDGE="${BIN_DIR}/nmux-bridge"
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+
+_banner() {
+  printf '\n'
+  printf "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
+  printf "${CYAN}${BOLD}  nmux セットアップウィザード${NC}\n"
+  printf "${CYAN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
+  printf '\n'
+}
+
+_step() { printf "${GREEN}[Step $1/$2]${NC} ${BOLD}%s${NC}\n" "$3"; }
+_info() { printf "  ${BLUE}→${NC} %s\n" "$*"; }
+_ok()   { printf "  ${GREEN}✓${NC} %s\n" "$*"; }
+_warn() { printf "  ${YELLOW}⚠${NC}  %s\n" "$*"; }
+_err()  { printf "  ${RED}✗${NC}  %s\n" "$*" >&2; }
+_ask()  { printf "${BOLD}?${NC} %s " "$*"; }
+
+_sep()  {
+  printf "${CYAN}──────────────────────────────────────────────────────────${NC}\n"
+}
+
+TOTAL_STEPS=5
+
+# ============================================================
+# Step 1: 前提チェック
+# ============================================================
+check_prerequisites() {
+  _step 1 "${TOTAL_STEPS}" "前提条件の確認"
+  local ok=1
+
+  # tmux セッション内かチェック
+  if [ -z "${TMUX:-}" ]; then
+    _err "tmux セッション外で実行されています"
+    printf '\n'
+    printf '  tmux を起動してから再実行してください:\n'
+    printf '    tmux new-session -s main\n'
+    printf '    nmux init\n'
+    exit 1
+  fi
+  _ok "tmux セッション内で動作中"
+
+  # nmux-bridge の存在確認
+  if [ ! -x "${BRIDGE}" ]; then
+    _err "nmux-bridge が見つかりません: ${BRIDGE}"
+    printf '  nmux をインストールしてください:\n'
+    printf '    curl -fsSL https://raw.githubusercontent.com/naotantan/nmux/main/install.sh | bash\n'
+    exit 1
+  fi
+  _ok "nmux-bridge: OK"
+
+  # claude コマンドの確認
+  if command -v claude >/dev/null 2>&1; then
+    _ok "claude コマンド: $(claude --version 2>/dev/null | head -1 || echo '検出済み')"
+  else
+    _warn "claude コマンドが見つかりません（後からインストール可能）"
+    _info "Claude Code: https://claude.ai/code"
+  fi
+
+  # Python3 の確認
+  if command -v python3 >/dev/null 2>&1; then
+    _ok "Python3: $(python3 --version 2>&1)"
+  else
+    _warn "Python3 が見つかりません（nmux-tui / nmux-dispatch が使えません）"
+    _info "インストール: brew install python3 (macOS) / apt install python3 (Linux)"
+  fi
+
+  printf '\n'
+  return "${ok}"
+}
+
+# ============================================================
+# Step 2: API トークン確認
+# ============================================================
+check_api_token() {
+  _step 2 "${TOTAL_STEPS}" "API トークンの確認"
+
+  local token_ok=0
+
+  # ANTHROPIC_API_KEY チェック
+  if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+    # プレースホルダーや不正な値でないかチェック
+    case "${ANTHROPIC_API_KEY}" in
+      sk-ant-*)
+        _ok "ANTHROPIC_API_KEY: 設定済み（有効な形式）"
+        token_ok=1
+        ;;
+      your-api-key*|YOUR_API_KEY*|placeholder*|PLACEHOLDER*|xxx*|XXX*)
+        _warn "ANTHROPIC_API_KEY がプレースホルダーのままです"
+        token_ok=0
+        ;;
+      *)
+        _warn "ANTHROPIC_API_KEY の形式が不正の可能性があります（通常 sk-ant- から始まります）"
+        token_ok=1  # 形式不明でもブロックしない（他モデル対応のため）
+        ;;
+    esac
+  else
+    _warn "ANTHROPIC_API_KEY が設定されていません"
+    token_ok=0
+  fi
+
+  if [ "${token_ok}" = "0" ]; then
+    printf '\n'
+    printf '  Claude Code を使う場合、API キーまたはログイン認証が必要です。\n'
+    printf '\n'
+    printf '  方法1: Claude Code にログイン（推奨）\n'
+    printf '    claude login\n'
+    printf '\n'
+    printf '  方法2: API キーを環境変数に設定\n'
+    printf '    export ANTHROPIC_API_KEY="sk-ant-..."\n'
+    printf '    # または ~/.zshrc / ~/.bashrc に追記してください\n'
+    printf '\n'
+    _ask "API キー未設定のまま続行しますか？ [y/N]:"
+    read -r ans
+    case "${ans}" in y|Y) ;; *)
+      printf '\n  設定後に再実行してください: nmux init\n\n'
+      exit 0
+      ;;
+    esac
+  fi
+
+  printf '\n'
+}
+
+# ============================================================
+# Step 3: ペイン設定
+# ============================================================
+setup_panes() {
+  _step 3 "${TOTAL_STEPS}" "tmux ペインの設定"
+
+  # 現在のペイン一覧
+  local pane_count
+  pane_count=$(tmux list-panes -a 2>/dev/null | wc -l | tr -d ' ')
+  _info "現在のペイン数: ${pane_count}"
+
+  # ペインが1つしかない場合は分割を提案
+  if [ "${pane_count}" -lt 2 ]; then
+    printf '\n'
+    printf '  AI エージェント間通信には最低2つのペインが必要です。\n'
+    _ask "ペインを自動で2分割しますか？ [Y/n]:"
+    read -r ans
+    case "${ans}" in n|N) _info "手動でペインを分割してください (prefix + % または prefix + \")" ;;
+    *)
+      tmux split-window -h 2>/dev/null || tmux split-window -v 2>/dev/null || {
+        _warn "自動分割に失敗しました。手動で分割してください。"
+      }
+      _ok "ペインを分割しました"
+      pane_count=$(tmux list-panes -a 2>/dev/null | wc -l | tr -d ' ')
+      ;;
+    esac
+  fi
+
+  printf '\n'
+  _info "現在のペイン一覧:"
+  "${BRIDGE}" list 2>/dev/null || true
+  printf '\n'
+
+  # エージェントラベルの設定
+  printf '  エージェントにラベルを付けます。\n'
+  printf '  ラベルは英数字とハイフンが使えます（例: agent-a, claude-1）\n'
+  printf '\n'
+
+  local panes
+  panes=$(tmux list-panes -a -F '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null)
+  local i=0
+  local agent_labels=()
+
+  while IFS= read -r pane_target; do
+    i=$((i + 1))
+    local default_label="agent-$(printf '%s' "${i}" | tr '123456789' 'abcdefghi')"
+    _ask "ペイン ${pane_target} のラベル [${default_label}]:"
+    read -r label_input
+    local label="${label_input:-${default_label}}"
+
+    # ラベルに使えない文字を除去
+    label=$(printf '%s' "${label}" | tr -cd '[:alnum:]-_')
+    if [ -z "${label}" ]; then
+      label="${default_label}"
+    fi
+
+    "${BRIDGE}" name "${pane_target}" "${label}" 2>/dev/null \
+      && _ok "ラベル設定: ${pane_target} → ${label}" \
+      || _warn "ラベル設定に失敗しました: ${pane_target}"
+
+    agent_labels+=("${label}")
+
+    # 3ペイン以上は多すぎる場合の確認
+    if [ "${i}" -ge 2 ]; then
+      _ask "次のペインも設定しますか？ [y/N]:"
+      read -r cont
+      case "${cont}" in y|Y) ;; *) break ;; esac
+    fi
+  done <<< "${panes}"
+
+  printf '\n'
+  _ok "ラベル設定完了（${#agent_labels[@]} エージェント）"
+  printf '\n'
+
+  # グローバルに保持
+  SETUP_AGENTS=("${agent_labels[@]}")
+}
+
+# ============================================================
+# Step 4: 接続テスト
+# ============================================================
+test_connection() {
+  _step 4 "${TOTAL_STEPS}" "接続テスト"
+
+  if [ "${#SETUP_AGENTS[@]}" -lt 2 ]; then
+    _warn "エージェントが2つ未満のためスキップします"
+    printf '\n'
+    return 0
+  fi
+
+  local agent_a="${SETUP_AGENTS[0]}"
+
+  _info "${agent_a} への疎通確認..."
+  if "${BRIDGE}" ping "${agent_a}" 3 2>/dev/null; then
+    _ok "接続確認: ${agent_a} 応答あり"
+  else
+    _warn "${agent_a} は現在応答していません（AI を起動してから再確認してください）"
+    _info "起動コマンド例: claude（各ペインで実行）"
+  fi
+
+  printf '\n'
+}
+
+# ============================================================
+# Step 5: セットアップ完了
+# ============================================================
+show_summary() {
+  _step 5 "${TOTAL_STEPS}" "セットアップ完了"
+  _sep
+
+  printf '\n'
+  printf "${GREEN}${BOLD}  nmux の準備ができました！${NC}\n"
+  printf '\n'
+
+  printf '  登録済みエージェント:\n'
+  for lbl in "${SETUP_AGENTS[@]}"; do
+    printf "    • %s\n" "${lbl}"
+  done
+  printf '\n'
+
+  if [ "${#SETUP_AGENTS[@]}" -ge 2 ]; then
+    local a="${SETUP_AGENTS[0]}"
+    local b="${SETUP_AGENTS[1]}"
+    printf '  次のコマンドで AI 同士を会話させられます:\n'
+    printf '\n'
+    printf "${CYAN}    nmux-converse %s %s \"AIの未来について議論して\"${NC}\n" "${a}" "${b}"
+    printf '\n'
+    printf '  TUI ダッシュボードで状態を監視:\n'
+    printf "${CYAN}    nmux tui${NC}\n"
+    printf '\n'
+  fi
+
+  printf '  ヘルプ:\n'
+  printf '    nmux help            — コマンド一覧\n'
+  printf '    nmux-bridge help     — ペイン通信コマンド一覧\n'
+  printf '    nmux-converse help   — 会話設定オプション一覧\n'
+  printf '\n'
+
+  _sep
+  printf '\n'
+}
+
+# ============================================================
+# メイン
+# ============================================================
+_banner
+
+check_prerequisites
+check_api_token
+setup_panes
+test_connection
+show_summary

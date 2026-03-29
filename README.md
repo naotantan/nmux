@@ -1,4 +1,4 @@
-# nmux v2.0.0
+# nmux v2.1.0
 
 **smux の強化フォーク** — tmux 上で複数の AI エージェントを連携・会話・並列実行するオーケストレーションツール
 
@@ -61,6 +61,15 @@ Python 3.6+ がある場合、nmux-dispatch / nmux-api / nmux-tui / nmux-convers
 
 ## クイックスタート（5分）
 
+### Step 0: 初回セットアップウィザード（推奨）
+
+インストール直後に以下を実行すると、依存チェック・ペイン設定・接続テストを対話形式で案内します。
+
+```bash
+tmux new-session -s main   # tmux を起動
+nmux init                  # セットアップウィザードを実行
+```
+
 ### Step 1: tmux でペインを開いてラベルを付ける
 
 ```bash
@@ -107,6 +116,7 @@ nmux-converse agent-a agent-b "AIの未来について議論して"
 
 ```
 nmux install                     # インストール（モード選択あり）
+nmux init                        # 初回セットアップウィザード
 nmux update                      # 最新版に更新
 nmux rollback                    # 前の設定に戻す
 nmux uninstall                   # 完全削除
@@ -464,20 +474,34 @@ nmux heartbeat status  # 状態確認
 
 ## トラブルシューティング
 
-**ログの確認:**
+### ログの確認
 
 ```bash
 # nmux 全体のログ
 ls ~/.nmux/logs/
 
+# bridge ログ（今日分）
+tail -f ~/.nmux/logs/bridge-$(date +%Y%m%d).log
+
 # converse セッションのログ
 ls ~/.nmux/state/converse/*.log
+tail -f ~/.nmux/state/converse/<セッション名>.log
 
 # デバッグモードで実行（SSH 通信エラーの詳細を表示）
 NMUX_DEBUG=1 nmux-converse agent-a agent-b "テスト"
 ```
 
-**よくある問題:**
+### テストで動作確認
+
+```bash
+# 静的テスト（tmux 不要）
+bash tests/test-nmux.sh static
+
+# 統合テスト（tmux 内で実行）
+bash tests/test-nmux.sh integration
+```
+
+### よくある問題
 
 | 症状 | 原因 | 対処 |
 |------|------|------|
@@ -486,6 +510,53 @@ NMUX_DEBUG=1 nmux-converse agent-a agent-b "テスト"
 | タイムアウト多発 | AI の応答が遅い | `--timeout` を延長 or `--turns` を減らす |
 | TUI が起動しない | Python 3.6+ 未インストール | `python3 --version` で確認し、インストール |
 | `skill-map.json` が見つからない | インストールが古い | `nmux update` で最新版に更新 |
+| API キー警告が出る | 認証未設定 | `claude login` または `export ANTHROPIC_API_KEY=...` |
+| `newline in string` エラー | 旧バージョンの nmux-converse | `nmux update` で v2.1+ に更新 |
+| TUI が固まる | 大量ペイン or Python クラッシュ | `q` で終了し `NMUX_TUI_INTERVAL=3` に変更 |
+
+### セットアップをやり直す
+
+```bash
+# ウィザードを再実行（ラベル設定のみやり直す）
+nmux init
+
+# 完全再インストール
+nmux uninstall
+curl -fsSL https://raw.githubusercontent.com/naotantan/nmux/main/install.sh | bash
+```
+
+### 状態のリセット
+
+```bash
+# 全ラベルをクリア
+rm -f ~/.nmux/state/label_*
+
+# 全 converse セッション情報をクリア
+rm -f ~/.nmux/state/converse/*.conf ~/.nmux/state/converse/*.pid
+
+# ログをクリア
+rm -f ~/.nmux/logs/*.log
+```
+
+### macOS 固有
+
+```bash
+# tmux のキーバインドが効かない場合
+tmux source ~/.nmux/tmux.conf
+
+# クリップボード連携（pbcopy）が動かない場合
+brew install reattach-to-user-namespace
+```
+
+### Linux (Ubuntu) 固有
+
+```bash
+# xclip が見つからない場合
+sudo apt-get install xclip
+
+# Python3 が古い場合（3.6 未満）
+sudo apt-get install python3.8 python3.8-distutils
+```
 
 ---
 
