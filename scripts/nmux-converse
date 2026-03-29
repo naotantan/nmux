@@ -450,6 +450,11 @@ _run_loop() {
   _SKILL_MAP_FILE=""
   _skill_map_load
 
+  # Feature B: スコアリング用状態変数
+  local _recent_timeouts=0 _recent_failures=0
+  local _resp_max=0 _resp_min=999999
+  local _SCALE_MAX=""
+
   # Ctrl+C / TERM で正常終了（#5: 可読性向上のため専用関数に抽出）
   _on_exit() {
     _info "会話を中断しました"
@@ -526,6 +531,7 @@ _run_loop() {
       _warn "${current_agent} タイムアウト (${timeout}s)"
       current_msg="[タイムアウト: ${current_agent} 応答なし]"
       printf '[Turn %d] TIMEOUT: %s\n\n' "${turn}" "${current_agent}" >> "${log_f}"
+      _recent_timeouts=$(( _recent_timeouts + 1 ))  # Feature B
       continue
     fi
 
@@ -543,6 +549,30 @@ _run_loop() {
     printf '[%s]\n%s\n\n' "${current_agent}" "${response}" >> "${log_f}"
 
     current_msg="${response}"
+
+    # Feature B: 応答長を記録してスコアリング
+    local resp_len
+    resp_len=$(printf '%s' "${response}" | wc -c | tr -d ' ')
+    [ "${resp_len}" -gt "${_resp_max}" ] && _resp_max="${resp_len}"
+    [ "${resp_len}" -lt "${_resp_min}" ] && _resp_min="${resp_len}"
+
+    local scale_score
+    scale_score=$(_score_scale_up \
+      "${_recent_timeouts}" "${_recent_failures}" \
+      "${_resp_max}" "${_resp_min}" \
+      "${turn}" "${max_turns}")
+
+    if [ "${scale_score}" -ge 5 ]; then
+      local recommended
+      recommended=$(_calc_recommended_count "${_recent_timeouts}" "${_recent_failures}")
+      local cur_agents
+      cur_agents=$(_get_agents "${name}")
+      _recommend_scale_up "${name}" "${recommended}" ${cur_agents}
+      # カウンタリセット（推奨後は次の蓄積サイクルへ）
+      _recent_timeouts=0; _recent_failures=0
+      _resp_max=0; _resp_min=999999
+    fi
+
     sleep "${interval}"
   done
 
