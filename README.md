@@ -175,12 +175,55 @@ nmux-converse add debate agent-c
 nmux-converse remove debate agent-b
 ```
 
+### スキル自動判別（Feature A）
+
+会話メッセージをリアルタイムに分析し、適切なスキルを自動検出・表示します。
+
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[Turn 3/10]  → agent-b
+[skill: code-reviewer ✓]       ← 検出されたスキルを表示
+▶ コードをレビューして
+```
+
+スキルが未インストールの場合はダイアログが表示され、テンプレートを自動生成できます。
+
+```bash
+# スキルマッピング一覧を確認
+nmux-converse skill-map
+```
+
+```
+SKILL                KEYWORDS                               INSTALLED
+--------------------------------------------------------------------
+brainstorming        設計, アーキテクチャ, 提案...          ✓
+code-reviewer        レビュー, コード確認, 品質...           ✗
+research             調査, 調べて, 比較...                  ✓
+```
+
+マッピングは `~/.nmux/skill-map.json` で自由に編集できます。
+
+### エージェント自動増設（Feature B）
+
+タイムアウトや応答負荷を監視し、増設が必要と判断した場合に提案ダイアログを表示します。
+
+```
+[自動増設の提案]
+現在の会話負荷が高まっています。
+AIの推奨追加数: 2名
+
+何名追加しますか？ (0でキャンセル):
+```
+
+承認すると tmux ペインを自動作成してセッションに追加します。
+
 ### セッション管理
 
 ```bash
 nmux-converse list              # 全セッション一覧（● = 稼働中）
 nmux-converse stop debate       # セッションを停止
 nmux-converse log debate 50     # ログの最新50行を表示
+nmux-converse skill-map         # スキルマッピング一覧
 ```
 
 ### コマンドリファレンス
