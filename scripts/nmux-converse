@@ -96,6 +96,172 @@ _agent_exists() {
   fi
 }
 
+# ── Feature A: スキル自動判別 ─────────────────────────────
+# skill-map.json をセッション開始時に変数にキャッシュする
+_skill_map_load() {
+  local map_f="${NMUX_DIR}/skill-map.json"
+  if [ ! -f "${map_f}" ]; then
+    _SKILL_MAP_LOADED=0
+    return
+  fi
+  _SKILL_MAP_FILE="${map_f}"
+  _SKILL_MAP_LOADED=1
+}
+
+# メッセージをキーワード分析してスキル名を返す（未検出なら空文字）
+_skill_detect() {
+  local message="$1"
+  [ "${_SKILL_MAP_LOADED:-0}" = "0" ] && return
+  # skip リストのスキルは除外してマッチング
+  python3 - "${message}" "${_SKILL_MAP_FILE}" <<'PYEOF' 2>/dev/null || true
+import sys, json
+message, map_file = sys.argv[1], sys.argv[2]
+try:
+    data = json.load(open(map_file))
+except Exception:
+    sys.exit(0)
+skip = data.get('skip', [])
+for skill_name, info in data.get('mappings', {}).items():
+    if skill_name in skip:
+        continue
+    for kw in info.get('keywords', []):
+        if kw in message:
+            print(skill_name)
+            sys.exit(0)
+PYEOF
+}
+
+# スキルディレクトリまたはスキルファイルが存在するか確認
+_skill_installed() {
+  local skill_name="$1"
+  local sd="${HOME}/.claude/skills"
+  [ -d "${sd}/${skill_name}" ] || [ -f "${sd}/${skill_name}.md" ]
+}
+
+# ターンヘッダーにスキル状態を1行表示する
+_skill_show() {
+  local skill_name="$1"
+  if [ -z "${skill_name}" ]; then
+    printf "${YELLOW}[skill: ? 汎用モード]${NC}\n"
+    return
+  fi
+  if _skill_installed "${skill_name}"; then
+    printf "${GREEN}[skill: %s ✓]${NC}\n" "${skill_name}"
+  else
+    printf "${RED}[skill: %s ✗]${NC}\n" "${skill_name}"
+  fi
+}
+
+# skill-map.json の skip 配列にスキル名を追記する
+_skill_map_skip() {
+  local skill_name="$1"
+  local map_f="${_SKILL_MAP_FILE:-${NMUX_DIR}/skill-map.json}"
+  [ -f "${map_f}" ] || return
+  python3 - "${map_f}" "${skill_name}" <<'PYEOF' 2>/dev/null || true
+import sys, json
+map_file, skill_name = sys.argv[1], sys.argv[2]
+try:
+    data = json.load(open(map_file))
+except Exception:
+    sys.exit(0)
+if skill_name not in data.get('skip', []):
+    data.setdefault('skip', []).append(skill_name)
+    json.dump(data, open(map_file, 'w'), ensure_ascii=False, indent=2)
+PYEOF
+  _info "'${skill_name}' の通知を無効化しました"
+}
+
+# スキルテンプレートを ~/.claude/skills/<name>/<name>.md に生成する
+_generate_skill_template() {
+  local skill_name="$1" tpl_choice="$2"
+  local skills_dir="${HOME}/.claude/skills/${skill_name}"
+  mkdir -p "${skills_dir}"
+  local content
+  case "${tpl_choice}" in
+    2) content="# ${skill_name}
+
+あなたはコードレビューの専門家です。可読性・セキュリティ・パフォーマンス・テスト・保守性の5軸で指摘します。" ;;
+    3) content="# ${skill_name}
+
+あなたは設計・ブレストの専門家です。アーキテクチャ提案・議論のファシリテーションを行います。" ;;
+    *) content="# ${skill_name}
+
+あなたは汎用アシスタントです。コーディング・相談・分析に幅広く対応します。" ;;
+  esac
+  printf '%s\n' "${content}" > "${skills_dir}/${skill_name}.md"
+  _info "スキル '${skill_name}' を作成しました: ${skills_dir}/${skill_name}.md"
+}
+
+# スキル未存在時の選択ダイアログ（同セッション中は1度だけ表示）
+_prompt_create_skill() {
+  local skill_name="$1"
+  # セッション内フラグで重複表示防止（ハイフンをアンダースコアに変換）
+  local flag_var="_SKILL_SKIP_$(printf '%s' "${skill_name}" | tr '-' '_')"
+  local flag_val
+  eval "flag_val=\${${flag_var}:-0}"
+  [ "${flag_val}" = "1" ] && return
+
+  printf "\n${RED}[skill: %s ✗]${NC}\n" "${skill_name}"
+  printf '"%s" スキルが見つかりません。どうしますか？\n\n' "${skill_name}"
+  printf '  1) 最小テンプレートを自動生成して使う（推奨）\n'
+  printf '  2) このセッションはスキルなしで続ける\n'
+  printf '  3) 今後このキーワードでは表示しない\n\n'
+  printf '選択 (1-3, デフォルト=1): '
+
+  local choice
+  read -r choice </dev/tty 2>/dev/null || choice="1"
+  [ -z "${choice}" ] && choice="1"
+
+  case "${choice}" in
+    1)
+      printf '\nスキルのベースを選んでください:\n\n'
+      printf '  1) 汎用アシスタント（コーディング・相談・分析に適用）\n'
+      printf '  2) コードレビュー特化（品質・セキュリティ・テスト重視）\n'
+      printf '  3) 設計・ブレスト特化（アーキテクチャ・提案・議論重視）\n\n'
+      printf '選択 (1-3): '
+      local tpl_choice
+      read -r tpl_choice </dev/tty 2>/dev/null || tpl_choice="1"
+      [ -z "${tpl_choice}" ] && tpl_choice="1"
+      _generate_skill_template "${skill_name}" "${tpl_choice}"
+      ;;
+    2)
+      eval "${flag_var}=1"
+      ;;
+    3)
+      _skill_map_skip "${skill_name}"
+      eval "${flag_var}=1"
+      ;;
+  esac
+}
+
+# cmd_skill_map — マッピング一覧表示
+cmd_skill_map() {
+  local map_f="${NMUX_DIR}/skill-map.json"
+  if [ ! -f "${map_f}" ]; then
+    _warn "skill-map.json が見つかりません: ${map_f}"
+    _warn "インストール後は ~/.nmux/skill-map.json に自動配置されます"
+    return 1
+  fi
+  python3 - "${map_f}" "${HOME}/.claude/skills" <<'PYEOF' 2>/dev/null || true
+import sys, json, os
+map_file, skills_dir = sys.argv[1], sys.argv[2]
+try:
+    data = json.load(open(map_file))
+except Exception:
+    print("skill-map.json の読み込みに失敗しました")
+    sys.exit(1)
+skip = data.get('skip', [])
+print(f"{'SKILL':<20} {'KEYWORDS':<38} INSTALLED")
+print("-" * 68)
+for name, info in data.get('mappings', {}).items():
+    kws = ", ".join(info.get('keywords', [])[:3]) + "..."
+    inst = "✓" if (os.path.isdir(f"{skills_dir}/{name}") or
+                   os.path.isfile(f"{skills_dir}/{name}.md")) else "✗"
+    sk = " (skip)" if name in skip else ""
+    print(f"{name:<20} {kws:<38} {inst}{sk}")
+PYEOF
+}
+
 # ── 応答抽出: 送信メッセージ以降、最後のプロンプト行を除く ──
 # #3: tmpfile を使わずパイプで処理（軽量化）
 # #3: 同一メッセージが複数回出現する場合、最後のマッチ以降を使用する
