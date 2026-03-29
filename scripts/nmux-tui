@@ -5,9 +5,13 @@
 import curses
 import json
 import os
+import re
 import subprocess
 import sys
 import time
+
+# pane_id の許容フォーマット: %N（tmux pane_id）または session:window.pane
+_PANE_ID_RE = re.compile(r'^%\d+$|^[\w-]+:\d+\.\d+$')
 
 # ── 定数 ──────────────────────────────────────────────────────
 NMUX_DIR    = os.path.join(os.environ.get("HOME", ""), ".nmux")
@@ -47,6 +51,12 @@ def _safe_addstr(win, y, x, s, attr=0):
 
 
 # ── データ取得 ─────────────────────────────────────────────────
+def _dbg(msg):
+    """NMUX_DEBUG=1 のとき stderr にデバッグログを出力する。"""
+    if os.environ.get("NMUX_DEBUG", "0") == "1":
+        print("[nmux-tui debug] {}".format(msg), file=sys.stderr)
+
+
 def _get_panes():
     """nmux-bridge list --json でペイン情報を取得する。失敗は空リストを返す。"""
     try:
@@ -56,13 +66,16 @@ def _get_panes():
         )
         if r.returncode == 0 and r.stdout.strip():
             return json.loads(r.stdout)
-    except Exception:
-        pass
+    except Exception as e:
+        _dbg("_get_panes: {}".format(e))
     return []
 
 
 def _get_last_line(pane_id):
     """tmux capture-pane で直近1行を取得する（Read Guard を汚染しない）。"""
+    # pane_id が期待フォーマット（%N または session:window.pane）でなければスキップ
+    if not pane_id or not _PANE_ID_RE.match(pane_id):
+        return "✗ OFFLINE"
     try:
         r = subprocess.run(
             ["tmux", "capture-pane", "-t", pane_id, "-p", "-S", "-1"],
@@ -71,8 +84,8 @@ def _get_last_line(pane_id):
         if r.returncode == 0:
             lines = [l for l in r.stdout.splitlines() if l.strip()]
             return lines[-1] if lines else ""
-    except Exception:
-        pass
+    except Exception as e:
+        _dbg("_get_last_line({}): {}".format(pane_id, e))
     return "✗ OFFLINE"
 
 
@@ -86,8 +99,8 @@ def _check_api():
             pid = int(f.read().strip())
         os.kill(pid, 0)   # シグナル 0: 存在確認のみ
         return True, ""
-    except (OSError, ValueError):
-        pass
+    except (OSError, ValueError) as e:
+        _dbg("_check_api: {}".format(e))
     return False, ""
 
 
@@ -95,11 +108,17 @@ def _get_api_port():
     """nmux.conf から NMUX_API_PORT を読む。なければデフォルト 8765。"""
     conf_file = os.path.join(NMUX_DIR, "nmux.conf")
     if os.path.isfile(conf_file):
-        with open(conf_file, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith("NMUX_API_PORT="):
-                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+        try:
+            with open(conf_file, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("NMUX_API_PORT="):
+                        port_str = line.split("=", 1)[1].strip().strip('"').strip("'")
+                        # ポート番号の妥当性確認（1–65535 の整数）
+                        if port_str.isdigit() and 1 <= int(port_str) <= 65535:
+                            return port_str
+        except OSError as e:
+            _dbg("_get_api_port: {}".format(e))
     return os.environ.get("NMUX_API_PORT", "8765")
 
 
@@ -232,39 +251,47 @@ class NmuxTUI:
 
         self.scr.refresh()
 
-    # ── dispatch ファイル指定ダイアログ ──────────────────────
-    def _dispatch_dialog(self):
+    # ── インライン文字入力ヘルパー ────────────────────────────
+    def _get_user_input(self, prompt):
+        """フッター行にプロンプトを表示してユーザー入力を受け取る。
+
+        Returns:
+            str | None: 確定した入力文字列。ESC キャンセル時は None。
+        """
         max_y, max_x = self.scr.getmaxyx()
-        prompt = " dispatch: JSON ファイルパスを入力 (ESC でキャンセル): "
-        _safe_addstr(self.scr, max_y - 1, 0, prompt[:max_x], curses.A_REVERSE)
-        self.scr.refresh()
+        buf = ""
 
         curses.echo()
         curses.curs_set(1)
-        buf = ""
-        start_x = min(len(prompt), max_x - 1)
+
         while True:
+            display = (prompt + buf)[:max_x]
+            _safe_addstr(self.scr, max_y - 1, 0, display.ljust(max_x), curses.A_REVERSE)
+            self.scr.refresh()
             try:
                 ch = self.scr.get_wch()
             except curses.error:
                 continue
-            if ch == 27:          # ESC
+            if ch == 27:                                    # ESC → キャンセル
+                buf = None
                 break
-            if ch in ("\n", "\r", curses.KEY_ENTER, 10):
-                if buf.strip():
-                    self._run_dispatch(buf.strip())
+            if ch in ("\n", "\r", curses.KEY_ENTER, 10):   # Enter → 確定
                 break
             if ch in (curses.KEY_BACKSPACE, 127, "\x7f"):
                 buf = buf[:-1]
             elif isinstance(ch, str) and ch.isprintable():
                 buf += ch
-            # リアルタイム表示
-            display = (prompt + buf)[:max_x]
-            _safe_addstr(self.scr, max_y - 1, 0, display.ljust(max_x), curses.A_REVERSE)
-            self.scr.refresh()
 
         curses.noecho()
         curses.curs_set(0)
+        return buf
+
+    # ── dispatch ファイル指定ダイアログ ──────────────────────
+    def _dispatch_dialog(self):
+        prompt = " dispatch: JSON ファイルパスを入力 (ESC でキャンセル): "
+        path = self._get_user_input(prompt)
+        if path and path.strip():
+            self._run_dispatch(path.strip())
 
     def _run_dispatch(self, path):
         """nmux-dispatch を実行し、結果をオーバーレイ表示する。"""
