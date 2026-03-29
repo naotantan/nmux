@@ -1,0 +1,338 @@
+#!/usr/bin/env bash
+# nmux-bridge — cross-pane agent communication CLI
+# macOS / Ubuntu both supported
+# https://github.com/naotantan/nmux
+set -euo pipefail
+
+NMUX_DIR="${HOME}/.nmux"
+LOG_DIR="${NMUX_DIR}/logs"
+STATE_DIR="${NMUX_DIR}/state"
+READ_MARK_TTL=60
+
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+_ts()  { date '+%Y-%m-%dT%H:%M:%S'; }
+
+_log() {
+  local level="$1"; shift
+  mkdir -p "${LOG_DIR}"
+  printf '%s [%s] %s\n' "$(_ts)" "${level}" "$*" \
+    >> "${LOG_DIR}/bridge-$(date +%Y%m%d).log"
+}
+
+_err() {
+  printf "${RED}error:${NC} %s\n" "$*" >&2
+  _log ERROR "$*"
+  exit 1
+}
+_warn() { printf "${YELLOW}warn:${NC} %s\n" "$*" >&2; _log WARN "$*"; }
+_dbg()  {
+  if [ "${NMUX_DEBUG:-0}" = "1" ]; then
+    printf "${BLUE}debug:${NC} %s\n" "$*" >&2
+  fi
+  _log DEBUG "$*"
+}
+
+_state_init() { mkdir -p "${STATE_DIR}"; }
+
+_label_file() { printf '%s/label_%s' "${STATE_DIR}" "$1"; }
+
+_mark_file() {
+  local safe
+  safe=$(printf '%s' "$1" | tr -c '[:alnum:]_' '_')
+  printf '%s/read_mark_%s' "${STATE_DIR}" "${safe}"
+}
+
+resolve_target() {
+  local target="$1"
+  _state_init
+
+  local lf
+  lf=$(_label_file "${target}")
+  if [ -f "${lf}" ]; then
+    local pid
+    pid=$(cat "${lf}")
+    if tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qx "${pid}"; then
+      _dbg "ラベル解決: ${target} → ${pid}"
+      printf '%s' "${pid}"
+      return 0
+    fi
+    rm -f "${lf}"
+    _warn "ラベル '${target}' のペインが存在しません。再設定してください。"
+  fi
+
+  case "${target}" in
+    %*|*:*.*|[0-9]*)
+      printf '%s' "${target}"
+      return 0
+      ;;
+  esac
+
+  _err "ターゲット '${target}' を解決できません。\n  nmux-bridge list でペイン一覧を確認してください。"
+}
+
+_set_mark() {
+  local pid="$1"
+  _state_init
+  printf '%s\n' "$(date +%s)" > "$(_mark_file "${pid}")"
+  _dbg "Read mark 設定: ${pid}"
+}
+
+_check_mark() {
+  local pid="$1"
+  local mf
+  mf=$(_mark_file "${pid}")
+  if [ ! -f "${mf}" ]; then
+    return 1
+  fi
+  local ts now age
+  ts=$(cat "${mf}")
+  now=$(date +%s)
+  age=$((now - ts))
+  if [ "${age}" -gt "${READ_MARK_TTL}" ]; then
+    rm -f "${mf}"
+    _warn "Read mark が期限切れ（${age}秒前）。再度 read してください。"
+    return 1
+  fi
+  return 0
+}
+
+_clear_mark() {
+  rm -f "$(_mark_file "$1")"
+  _dbg "Read mark クリア: $1"
+}
+
+cmd_list() {
+  _state_init
+
+  local label_map
+  label_map=$(mktemp)
+
+  for lf in "${STATE_DIR}"/label_*; do
+    if [ -f "${lf}" ]; then
+      local pid lname
+      pid=$(cat "${lf}")
+      lname=$(basename "${lf}" | sed 's/^label_//')
+      printf '%s %s\n' "${pid}" "${lname}" >> "${label_map}"
+    fi
+  done
+
+  printf '\033[1m%-14s %-10s %-20s %-8s %-16s\033[0m\n' \
+    "TARGET" "PANE_ID" "PROCESS" "SIZE" "LABEL"
+  printf '%.0s─' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
+    21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 \
+    41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 \
+    61 62 63 64 65 66 67 68 69 70
+  printf '\n'
+
+  tmux list-panes -a \
+    -F '#{session_name}:#{window_index}.#{pane_index} #{pane_id} #{pane_current_command} #{pane_width}x#{pane_height} #{@name}' \
+    2>/dev/null | while IFS=' ' read -r target pid process size tmux_label; do
+      file_label=$(grep -m1 "^${pid} " "${label_map}" 2>/dev/null | awk '{print $2}' || true)
+      display="${tmux_label:-${file_label:--}}"
+      printf '%-14s %-10s %-20s %-8s %-16s\n' \
+        "${target}" "${pid}" "${process}" "${size}" "${display}"
+    done
+
+  rm -f "${label_map}"
+}
+
+cmd_read() {
+  local target="$1"
+  local lines="${2:-50}"
+  local pid
+  pid=$(resolve_target "${target}")
+
+  case "${lines}" in
+    ''|*[!0-9]*) _err "行数は正の整数で指定してください: ${lines}" ;;
+  esac
+
+  local out
+  out=$(tmux capture-pane -t "${pid}" -p -S "-${lines}" 2>/dev/null) \
+    || _err "ペインの読み取りに失敗しました: ${pid}"
+
+  _set_mark "${pid}"
+  _log INFO "read target=${target} pane=${pid} lines=${lines}"
+  printf '%s\n' "${out}"
+}
+
+cmd_type() {
+  local target="$1"; shift
+  local text="$*"
+  local pid
+  pid=$(resolve_target "${target}")
+
+  if ! _check_mark "${pid}"; then
+    _err "ペインを先に読んでください:\n  nmux-bridge read ${target}"
+  fi
+
+  tmux send-keys -t "${pid}" -l -- "${text}" \
+    || _err "テキスト送信に失敗しました: ${pid}"
+  _clear_mark "${pid}"
+  _log INFO "type target=${target} pane=${pid} len=${#text}"
+}
+
+cmd_keys() {
+  local target="$1"; shift
+  local pid
+  pid=$(resolve_target "${target}")
+
+  if ! _check_mark "${pid}"; then
+    _err "ペインを先に読んでください:\n  nmux-bridge read ${target}"
+  fi
+
+  tmux send-keys -t "${pid}" "$@" \
+    || _err "キー送信に失敗しました: ${pid} ($*)"
+  _clear_mark "${pid}"
+  _log INFO "keys target=${target} pane=${pid} keys=$*"
+}
+
+cmd_message() {
+  local target="$1"; shift
+  local text="$*"
+  local pid
+  pid=$(resolve_target "${target}")
+
+  if ! _check_mark "${pid}"; then
+    _err "ペインを先に読んでください:\n  nmux-bridge read ${target}"
+  fi
+
+  local my_pid my_session from
+  my_pid=$(tmux display-message -p '#{pane_id}' 2>/dev/null || printf 'unknown')
+  my_session=$(tmux display-message -p '#{session_name}:#{window_index}.#{pane_index}' 2>/dev/null || printf 'unknown')
+
+  from="${my_pid}"
+  for lf in "${STATE_DIR}"/label_*; do
+    if [ -f "${lf}" ]; then
+      local lpid lname
+      lpid=$(cat "${lf}")
+      lname=$(basename "${lf}" | sed 's/^label_//')
+      if [ "${lpid}" = "${my_pid}" ]; then
+        from="${lname}"
+        break
+      fi
+    fi
+  done
+
+  local header="[nmux-bridge from:${from} pane:${my_pid} at:${my_session}]"
+  tmux send-keys -t "${pid}" -l -- "${header} ${text}" \
+    || _err "メッセージ送信に失敗しました: ${pid}"
+  _clear_mark "${pid}"
+  _log INFO "message target=${target} pane=${pid} from=${from}"
+}
+
+cmd_name() {
+  local target="$1"
+  local label="$2"
+  local pid
+  pid=$(resolve_target "${target}")
+  _state_init
+
+  printf '%s\n' "${pid}" > "$(_label_file "${label}")"
+  tmux set-option -p -t "${pid}" @name "${label}" 2>/dev/null || true
+  _log INFO "name target=${target} pane=${pid} label=${label}"
+  printf 'ラベル設定: %s → %s\n' "${pid}" "${label}"
+}
+
+cmd_resolve() {
+  local label="$1"
+  local lf
+  lf=$(_label_file "${label}")
+  if [ -f "${lf}" ]; then
+    cat "${lf}"
+  else
+    _err "ラベル '${label}' が見つかりません"
+  fi
+}
+
+cmd_id() {
+  tmux display-message -p '#{pane_id}' 2>/dev/null \
+    || _err "tmux セッション外で実行されています"
+}
+
+cmd_wait() {
+  local target="$1"
+  local pattern="${2:-[$]}"
+  local timeout="${3:-30}"
+  local pid
+  pid=$(resolve_target "${target}")
+
+  case "${timeout}" in
+    ''|*[!0-9]*) _err "タイムアウトは正の整数で指定してください: ${timeout}" ;;
+  esac
+
+  _log INFO "wait target=${target} pattern=${pattern} timeout=${timeout}s"
+  local elapsed=0
+  while [ "${elapsed}" -lt "${timeout}" ]; do
+    local out
+    out=$(tmux capture-pane -t "${pid}" -p -S -10 2>/dev/null || true)
+    if printf '%s\n' "${out}" | grep -qE "${pattern}"; then
+      _set_mark "${pid}"
+      printf '検出: %s (%d秒後)\n' "${pattern}" "${elapsed}"
+      return 0
+    fi
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+  _err "タイムアウト: '${pattern}' が ${timeout}秒以内に現れませんでした"
+}
+
+cmd_log() {
+  local n="${1:-50}"
+  local lf
+  lf="${LOG_DIR}/bridge-$(date +%Y%m%d).log"
+  if [ -f "${lf}" ]; then
+    tail -n "${n}" "${lf}"
+  else
+    printf 'ログファイルが見つかりません: %s\n' "${lf}"
+  fi
+}
+
+cmd_help() {
+  cat <<'HELP'
+
+nmux-bridge — クロスペイン AI エージェント通信 CLI
+
+使い方: nmux-bridge <コマンド> [引数...]
+
+コマンド:
+  list                              全ペイン一覧
+  read <target> [lines]             末尾 N 行を読む（デフォルト 50）
+  type <target> <text>              テキスト入力（Enter なし）
+  keys <target> <key>...            特殊キー送信
+  message <target> <text>           送信元情報付きメッセージ
+  name <target> <label>             ペインにラベルを付ける
+  resolve <label>                   ラベル → ペイン ID 解決
+  id                                自分のペイン ID を表示
+  wait <target> [pattern] [timeout] パターン出現まで待機
+  log [N]                           ブリッジログ表示
+
+HELP
+}
+
+if [ $# -eq 0 ]; then
+  cmd_help
+  exit 0
+fi
+
+case "$1" in
+  list)                 cmd_list ;;
+  read)    shift;       cmd_read "$@" ;;
+  type)    shift;       cmd_type "$@" ;;
+  keys)    shift;       cmd_keys "$@" ;;
+  message) shift;       cmd_message "$@" ;;
+  name)    shift;       cmd_name "$@" ;;
+  resolve) shift;       cmd_resolve "$@" ;;
+  id)                   cmd_id ;;
+  wait)    shift;       cmd_wait "$@" ;;
+  log)     shift;       cmd_log "${1:-50}" ;;
+  help|--help|-h)       cmd_help ;;
+  *)
+    printf "${RED}error:${NC} 不明なコマンド: %s\n" "$1" >&2
+    printf '  nmux-bridge help で使い方を確認してください。\n' >&2
+    exit 1
+    ;;
+esac

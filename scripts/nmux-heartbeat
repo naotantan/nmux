@@ -1,0 +1,326 @@
+#!/usr/bin/env bash
+# nmux-heartbeat — sub machine heartbeat monitor
+# 1秒間隔でサブ機の死活を監視し tmux ステータスバーとペインに通知する
+# https://github.com/naotantan/nmux
+set -euo pipefail
+
+NMUX_DIR="${HOME}/.nmux"
+STATE_DIR="${NMUX_DIR}/state"
+LOG_DIR="${NMUX_DIR}/logs"
+CONF_FILE="${NMUX_DIR}/nmux.conf"
+PID_FILE="${STATE_DIR}/heartbeat.pid"
+STATUS_FILE="${STATE_DIR}/heartbeat.status"
+LAST_ALERT_FILE="${STATE_DIR}/heartbeat.last_alert"
+
+# デフォルト設定（nmux.conf で上書き）
+NMUX_HEARTBEAT_INTERVAL="${NMUX_HEARTBEAT_INTERVAL:-1}"
+REMOTE_HOST="${REMOTE_HOST:-}"
+REMOTE_USER="${REMOTE_USER:-}"
+REMOTE_PORT="${REMOTE_PORT:-22}"
+
+# --- Colors ---
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# --- Config ---
+if [ -f "${CONF_FILE}" ]; then
+  # shellcheck source=/dev/null
+  . "${CONF_FILE}"
+fi
+
+# --- Logging ---
+_log() {
+  local level="$1"; shift
+  mkdir -p "${LOG_DIR}"
+  printf '%s [%s] [heartbeat] %s\n' \
+    "$(date '+%Y-%m-%dT%H:%M:%S')" "${level}" "$*" \
+    >> "${LOG_DIR}/heartbeat-$(date +%Y%m%d).log"
+}
+
+_err()  { printf "${RED}error:${NC} %s\n" "$*" >&2; _log ERROR "$*"; exit 1; }
+_info() { printf "${GREEN}[nmux-heartbeat]${NC} %s\n" "$*"; _log INFO "$*"; }
+_warn() { printf "${YELLOW}[nmux-heartbeat]${NC} %s\n" "$*"; _log WARN "$*"; }
+
+# ============================================================
+# OS 検出
+# ============================================================
+detect_os() {
+  case "$(uname -s)" in
+    Darwin) echo "macos" ;;
+    Linux)  echo "linux" ;;
+    *)      echo "unknown" ;;
+  esac
+}
+
+OS=$(detect_os)
+
+# ============================================================
+# SSH ping（タイムアウト3秒）
+# ============================================================
+ping_remote() {
+  if [ -z "${REMOTE_HOST}" ]; then
+    return 1
+  fi
+  ssh -q \
+    -o ConnectTimeout=3 \
+    -o StrictHostKeyChecking=no \
+    -o BatchMode=yes \
+    -p "${REMOTE_PORT}" \
+    "${REMOTE_USER}@${REMOTE_HOST}" \
+    'true' 2>/dev/null
+}
+
+# ============================================================
+# tmux ステータスバー更新
+# ============================================================
+update_status_bar() {
+  local status="$1"   # online / offline
+  local host="${REMOTE_HOST:-unknown}"
+
+  if ! tmux list-sessions >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local label
+  if [ "${status}" = "online" ]; then
+    label="#[fg=green]● ${host}#[default]"
+  else
+    label="#[fg=red,bold]✗ ${host} OFFLINE#[default]"
+  fi
+
+  # status-right に nmux ハートビート情報を埋め込む
+  tmux set-option -g status-right \
+    " ${label} #[fg=colour245]| #{session_name} " 2>/dev/null || true
+}
+
+# ============================================================
+# ペインへの警告メッセージ
+# ============================================================
+alert_panes() {
+  local msg="$1"
+
+  if ! tmux list-sessions >/dev/null 2>&1; then
+    return 0
+  fi
+
+  # すべてのペインに表示（ユーザーが作業中のペインは除外しない）
+  tmux list-panes -a -F '#{pane_id}' 2>/dev/null | while IFS= read -r pane; do
+    tmux display-message -t "${pane}" "${msg}" 2>/dev/null || true
+  done
+}
+
+# ============================================================
+# macOS システム通知
+# ============================================================
+notify_macos() {
+  local title="$1"
+  local msg="$2"
+  if [ "${OS}" = "macos" ] && command -v osascript >/dev/null 2>&1; then
+    osascript -e "display notification \"${msg}\" with title \"${title}\"" \
+      2>/dev/null || true
+  fi
+}
+
+# ============================================================
+# アラート送信（重複抑制: 同じ状態では1回のみ）
+# ============================================================
+send_alert() {
+  local status="$1"
+  local host="${REMOTE_HOST:-unknown}"
+
+  # 前回と同じ状態ならスキップ
+  local last_status=""
+  if [ -f "${LAST_ALERT_FILE}" ]; then
+    last_status=$(cat "${LAST_ALERT_FILE}")
+  fi
+  if [ "${last_status}" = "${status}" ]; then
+    return 0
+  fi
+
+  printf '%s\n' "${status}" > "${LAST_ALERT_FILE}"
+
+  if [ "${status}" = "offline" ]; then
+    local msg="[nmux] ⚠ サブ機 ${host} がオフラインです"
+    _warn "${msg}"
+    alert_panes "${msg}"
+    notify_macos "nmux ハートビート警告" "サブ機 ${host} がオフラインになりました"
+    _log WARN "サブ機オフライン: ${host}"
+  else
+    local msg="[nmux] ✓ サブ機 ${host} が復帰しました"
+    _info "${msg}"
+    alert_panes "${msg}"
+    notify_macos "nmux ハートビート" "サブ機 ${host} が復帰しました"
+    _log INFO "サブ機復帰: ${host}"
+  fi
+}
+
+# ============================================================
+# メインループ（バックグラウンド）
+# ============================================================
+_loop() {
+  _log INFO "ハートビート開始: ${REMOTE_HOST} (間隔: ${NMUX_HEARTBEAT_INTERVAL}秒)"
+
+  local prev_status=""
+
+  while true; do
+    local current_status
+    if ping_remote; then
+      current_status="online"
+    else
+      current_status="offline"
+    fi
+
+    # ステータスファイル更新
+    printf '%s %s\n' "${current_status}" "$(date '+%Y-%m-%dT%H:%M:%S')" \
+      > "${STATUS_FILE}"
+
+    # ステータスバー更新（毎回）
+    update_status_bar "${current_status}"
+
+    # 状態が変化した場合のみアラート
+    if [ "${current_status}" != "${prev_status}" ]; then
+      send_alert "${current_status}"
+    fi
+
+    prev_status="${current_status}"
+    sleep "${NMUX_HEARTBEAT_INTERVAL}"
+  done
+}
+
+# ============================================================
+# コマンド実装
+# ============================================================
+
+cmd_start() {
+  if [ -z "${REMOTE_HOST}" ]; then
+    _err "サブ機が設定されていません。nmux.conf を確認してください。\n  REMOTE_HOST が未設定です。"
+  fi
+
+  # 二重起動チェック
+  if [ -f "${PID_FILE}" ]; then
+    local old_pid
+    old_pid=$(cat "${PID_FILE}")
+    if kill -0 "${old_pid}" 2>/dev/null; then
+      _warn "ハートビートはすでに稼働中です (PID: ${old_pid})"
+      return 0
+    fi
+    rm -f "${PID_FILE}"
+  fi
+
+  mkdir -p "${STATE_DIR}"
+
+  # バックグラウンドで起動
+  _loop &
+  local hb_pid=$!
+  printf '%d\n' "${hb_pid}" > "${PID_FILE}"
+  _info "ハートビート開始 (PID: ${hb_pid}, 対象: ${REMOTE_HOST}, 間隔: ${NMUX_HEARTBEAT_INTERVAL}秒)"
+}
+
+cmd_stop() {
+  if [ ! -f "${PID_FILE}" ]; then
+    _warn "ハートビートは稼働していません"
+    return 0
+  fi
+
+  local pid
+  pid=$(cat "${PID_FILE}")
+  if kill "${pid}" 2>/dev/null; then
+    _info "ハートビートを停止しました (PID: ${pid})"
+  else
+    _warn "プロセスが見つかりません (PID: ${pid})"
+  fi
+
+  rm -f "${PID_FILE}" "${STATUS_FILE}" "${LAST_ALERT_FILE}"
+
+  # ステータスバーをリセット
+  if tmux list-sessions >/dev/null 2>&1; then
+    tmux set-option -g status-right ' #{session_name} ' 2>/dev/null || true
+  fi
+}
+
+cmd_status() {
+  echo ""
+  printf "%b%bハートビート ステータス%b\n" "${BOLD}" "" "${NC}"
+  printf '────────────────────────────────\n'
+
+  if [ ! -f "${PID_FILE}" ]; then
+    printf '  状態:     停止中\n\n'
+    return 0
+  fi
+
+  local pid
+  pid=$(cat "${PID_FILE}")
+  if kill -0 "${pid}" 2>/dev/null; then
+    printf '  状態:     %b稼働中%b (PID: %s)\n' "${GREEN}" "${NC}" "${pid}"
+  else
+    printf '  状態:     %b異常停止%b\n' "${RED}" "${NC}"
+    rm -f "${PID_FILE}"
+  fi
+
+  printf '  監視対象: %s@%s:%s\n' \
+    "${REMOTE_USER:-?}" "${REMOTE_HOST:-未設定}" "${REMOTE_PORT:-22}"
+  printf '  間隔:     %s秒\n' "${NMUX_HEARTBEAT_INTERVAL}"
+
+  if [ -f "${STATUS_FILE}" ]; then
+    local st ts
+    st=$(awk '{print $1}' "${STATUS_FILE}")
+    ts=$(awk '{print $2}' "${STATUS_FILE}")
+    if [ "${st}" = "online" ]; then
+      printf '  サブ機:   %b● オンライン%b (%s)\n' "${GREEN}" "${NC}" "${ts}"
+    else
+      printf '  サブ機:   %b✗ オフライン%b (%s)\n' "${RED}" "${NC}" "${ts}"
+    fi
+  fi
+
+  printf '\n'
+}
+
+cmd_log() {
+  local n="${1:-50}"
+  local lf
+  lf="${LOG_DIR}/heartbeat-$(date +%Y%m%d).log"
+  if [ -f "${lf}" ]; then
+    tail -n "${n}" "${lf}"
+  else
+    printf 'ログが見つかりません: %s\n' "${lf}"
+  fi
+}
+
+cmd_help() {
+  cat <<'HELP'
+
+nmux-heartbeat — サブ機死活監視
+
+使い方: nmux-heartbeat <コマンド>
+
+コマンド:
+  start     監視を開始（バックグラウンド）
+  stop      監視を停止
+  status    現在の状態を表示
+  log [N]   直近 N 行のログを表示
+
+設定 (~/.nmux/nmux.conf):
+  REMOTE_HOST               監視対象ホスト
+  NMUX_HEARTBEAT_INTERVAL   監視間隔（秒、デフォルト: 1）
+
+HELP
+}
+
+# ============================================================
+# メイン
+# ============================================================
+case "${1:-status}" in
+  start)        cmd_start ;;
+  stop)         cmd_stop ;;
+  status)       cmd_status ;;
+  log)          shift; cmd_log "${1:-50}" ;;
+  help|--help)  cmd_help ;;
+  *)
+    printf "${RED}error:${NC} 不明なコマンド: %s\n" "$1" >&2
+    cmd_help
+    exit 1
+    ;;
+esac

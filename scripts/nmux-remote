@@ -1,0 +1,246 @@
+#!/usr/bin/env bash
+# nmux-remote — cross-machine nmux-bridge wrapper (SSH)
+# macOS / Ubuntu both supported (main & sub)
+# https://github.com/naotantan/nmux
+set -euo pipefail
+
+NMUX_DIR="${HOME}/.nmux"
+CONF_FILE="${NMUX_DIR}/nmux.conf"
+LOG_DIR="${NMUX_DIR}/logs"
+STATE_DIR="${NMUX_DIR}/state"
+
+# デフォルト設定（nmux.conf で上書き）
+REMOTE_HOST="${REMOTE_HOST:-}"
+REMOTE_USER="${REMOTE_USER:-$(whoami)}"
+REMOTE_PORT="${REMOTE_PORT:-22}"
+REMOTE_BRIDGE="${REMOTE_BRIDGE:-\$HOME/.nmux/bin/nmux-bridge}"
+
+if [ -f "${CONF_FILE}" ]; then
+  # shellcheck source=/dev/null
+  . "${CONF_FILE}"
+fi
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m'
+
+_log() {
+  local level="$1"; shift
+  mkdir -p "${LOG_DIR}"
+  printf '%s [%s] [remote] %s\n' \
+    "$(date '+%Y-%m-%dT%H:%M:%S')" "${level}" "$*" \
+    >> "${LOG_DIR}/remote-$(date +%Y%m%d).log"
+}
+_err()  { printf "${RED}error:${NC} %s\n" "$*" >&2; _log ERROR "$*"; exit 1; }
+_warn() { printf "${YELLOW}warn:${NC} %s\n"  "$*" >&2; _log WARN  "$*"; }
+_info() { printf "${GREEN}[nmux-remote]${NC} %s\n" "$*"; _log INFO "$*"; }
+
+_require_host() {
+  if [ -z "${REMOTE_HOST}" ]; then
+    _err "サブ機が設定されていません。\n  nmux install でクロスマシンモードを選択するか、\n  ~/.nmux/nmux.conf に REMOTE_HOST を設定してください。"
+  fi
+}
+
+check_ssh() {
+  _require_host
+  if ! ssh -q \
+       -o ConnectTimeout=5 \
+       -o StrictHostKeyChecking=no \
+       -o BatchMode=yes \
+       -p "${REMOTE_PORT}" \
+       "${REMOTE_USER}@${REMOTE_HOST}" \
+       'true' 2>/dev/null; then
+    _err "SSH 接続失敗: ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PORT}\n  ~/.ssh/config を確認してください。"
+  fi
+  _log INFO "SSH OK: ${REMOTE_USER}@${REMOTE_HOST}"
+}
+
+remote_run() {
+  ssh -q \
+    -o ConnectTimeout=10 \
+    -o StrictHostKeyChecking=no \
+    -p "${REMOTE_PORT}" \
+    "${REMOTE_USER}@${REMOTE_HOST}" \
+    "NMUX_DEBUG=${NMUX_DEBUG:-0} ${REMOTE_BRIDGE} $*"
+}
+
+# --- ローカル Read Guard（リモート用）---
+_remote_mark_file() {
+  local safe
+  safe=$(printf '%s' "${REMOTE_HOST}_$1" | tr -c '[:alnum:]_' '_')
+  printf '%s/remote_mark_%s' "${STATE_DIR}" "${safe}"
+}
+
+_set_remote_mark() {
+  mkdir -p "${STATE_DIR}"
+  printf '%s\n' "$(date +%s)" > "$(_remote_mark_file "$1")"
+}
+
+_check_remote_mark() {
+  local mf
+  mf=$(_remote_mark_file "$1")
+  [ -f "${mf}" ] || return 1
+  local ts now age
+  ts=$(cat "${mf}")
+  now=$(date +%s)
+  age=$((now - ts))
+  [ "${age}" -le 60 ] || { rm -f "${mf}"; return 1; }
+  return 0
+}
+
+_clear_remote_mark() {
+  rm -f "$(_remote_mark_file "$1")"
+}
+
+# ============================================================
+# コマンド実装
+# ============================================================
+
+cmd_list() {
+  _require_host
+  check_ssh
+  _info "サブ機 (${REMOTE_HOST}) のペイン一覧:"
+  remote_run list
+}
+
+cmd_read() {
+  local target="$1"
+  local lines="${2:-50}"
+  _require_host
+  check_ssh
+  _log INFO "read remote=${REMOTE_HOST} target=${target} lines=${lines}"
+  remote_run read "${target}" "${lines}"
+  _set_remote_mark "${target}"
+}
+
+cmd_type() {
+  local target="$1"; shift
+  local text="$*"
+  _check_remote_mark "${target}" \
+    || _err "先に read を実行してください:\n  nmux-remote read ${target}"
+  _require_host
+  remote_run type "${target}" "${text}"
+  _clear_remote_mark "${target}"
+  _log INFO "type remote=${REMOTE_HOST} target=${target}"
+}
+
+cmd_keys() {
+  local target="$1"; shift
+  _check_remote_mark "${target}" \
+    || _err "先に read を実行してください:\n  nmux-remote read ${target}"
+  _require_host
+  remote_run keys "${target}" "$@"
+  _clear_remote_mark "${target}"
+  _log INFO "keys remote=${REMOTE_HOST} target=${target} keys=$*"
+}
+
+cmd_message() {
+  local target="$1"; shift
+  local text="$*"
+  _check_remote_mark "${target}" \
+    || _err "先に read を実行してください:\n  nmux-remote read ${target}"
+  _require_host
+
+  local from
+  from="main@$(hostname -s 2>/dev/null || printf 'local')"
+  local header="[nmux-remote from:${from} host:${REMOTE_HOST}]"
+  remote_run type "${target}" "${header} ${text}"
+  _clear_remote_mark "${target}"
+  _log INFO "message remote=${REMOTE_HOST} target=${target} from=${from}"
+}
+
+cmd_wait() {
+  local target="$1"
+  local pattern="${2:-[$]}"
+  local timeout="${3:-30}"
+  _require_host
+  check_ssh
+  _info "サブ機 (${REMOTE_HOST}:${target}) でパターン待機: ${pattern} (${timeout}s)"
+  remote_run wait "${target}" "${pattern}" "${timeout}"
+  _set_remote_mark "${target}"
+}
+
+cmd_setup() {
+  _require_host
+  _info "サブ機 (${REMOTE_HOST}) への nmux セットアップを確認中..."
+  check_ssh
+
+  if ! ssh -q \
+       -o ConnectTimeout=10 \
+       -p "${REMOTE_PORT}" \
+       "${REMOTE_USER}@${REMOTE_HOST}" \
+       "command -v nmux-bridge >/dev/null 2>&1"; then
+    _warn "サブ機に nmux が見つかりません。インストールします..."
+    ssh -p "${REMOTE_PORT}" \
+      "${REMOTE_USER}@${REMOTE_HOST}" \
+      "curl -fsSL https://raw.githubusercontent.com/naotantan/nmux/main/install.sh | bash -s -- --sub"
+    _info "サブ機へのインストール完了"
+  else
+    local remote_ver
+    remote_ver=$(ssh -q \
+      -p "${REMOTE_PORT}" \
+      "${REMOTE_USER}@${REMOTE_HOST}" \
+      'cat "${HOME}/.nmux/VERSION" 2>/dev/null || echo 不明')
+    _info "サブ機の nmux バージョン: ${remote_ver}"
+  fi
+}
+
+cmd_ping() {
+  _require_host
+  _info "接続確認: ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PORT}"
+  check_ssh
+  _info "接続 OK"
+  echo ""
+  remote_run list
+}
+
+cmd_help() {
+  cat <<HELP
+
+nmux-remote — クロスマシン通信 CLI (macOS / Ubuntu)
+
+使い方: nmux-remote <コマンド> [引数...]
+
+コマンド:
+  setup                     サブ機への nmux インストール確認
+  ping                      SSH 接続テスト + サブ機ペイン一覧
+  list                      サブ機のペイン一覧
+  read <target> [lines]     サブ機ペインを読む
+  type <target> <text>      サブ機ペインへテキスト入力
+  keys <target> <key>...    サブ機ペインへキー送信
+  message <target> <text>   メイン機からのメッセージ送信
+  wait <target> [pat] [sec] サブ機ペインのパターン待機
+
+設定: ~/.nmux/nmux.conf
+  REMOTE_HOST   サブ機のホスト名または IP
+  REMOTE_USER   SSH ユーザー名
+  REMOTE_PORT   SSH ポート（デフォルト: 22）
+
+環境変数:
+  NMUX_DEBUG=1  デバッグログ有効化
+
+HELP
+}
+
+if [ $# -eq 0 ]; then
+  cmd_help
+  exit 0
+fi
+
+case "$1" in
+  setup)               cmd_setup ;;
+  ping)                cmd_ping ;;
+  list)                cmd_list ;;
+  read)    shift;      cmd_read "$@" ;;
+  type)    shift;      cmd_type "$@" ;;
+  keys)    shift;      cmd_keys "$@" ;;
+  message) shift;      cmd_message "$@" ;;
+  wait)    shift;      cmd_wait "$@" ;;
+  help|--help|-h)      cmd_help ;;
+  *)
+    printf "${RED}error:${NC} 不明なコマンド: %s\n" "$1" >&2
+    printf '  nmux-remote help で使い方を確認してください。\n' >&2
+    exit 1
+    ;;
+esac
