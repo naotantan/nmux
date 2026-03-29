@@ -9,6 +9,7 @@ import re
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # pane_id の許容フォーマット: %N（tmux pane_id）または session:window.pane
 _PANE_ID_RE = re.compile(r'^%\d+$|^[\w-]+:\d+\.\d+$')
@@ -317,16 +318,36 @@ class NmuxTUI:
             return int(manual)
         return _INTERVAL_SMALL if len(self.panes) <= 20 else _INTERVAL_LARGE
 
-    # ── ペイン行データ構築（curses 非依存・単体テスト可） ────
+    # ── ペイン行データ構築（並列フェッチ） ──────────────────
     def _build_pane_rows(self, col_widths):
-        """ペインごとの表示文字列を返す。curses に依存しない純粋メソッド。
+        """ペインごとの表示文字列を返す。ThreadPoolExecutor で並列取得。
 
         Returns:
             list of dict: {target, label, status, status_color, is_ai, last, offline}
         """
+        if not self.panes:
+            return []
+
+        # 各ペインの last_output を並列取得（I/O バウンドなのでスレッドが有効）
+        def _fetch(pane):
+            return pane, _get_last_output(pane.get("pane_id", ""))
+
+        results = {}
+        max_workers = min(len(self.panes), 8)  # 最大8スレッド
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_fetch, p): i for i, p in enumerate(self.panes)}
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                try:
+                    pane, (last_raw, _) = fut.result()
+                    results[idx] = (pane, last_raw)
+                except Exception as e:
+                    _dbg("_build_pane_rows fetch[{}]: {}".format(idx, e))
+                    results[idx] = (self.panes[idx], "✗ OFFLINE")
+
         rows = []
-        for pane in self.panes:
-            last_raw, _ = _get_last_output(pane.get("pane_id", ""))
+        for idx in range(len(self.panes)):
+            pane, last_raw = results.get(idx, (self.panes[idx], "✗ OFFLINE"))
             process     = pane.get("process", "")
             status_str, status_color, is_ai = _get_agent_status(process, last_raw)
             last        = _truncate(last_raw, col_widths["out"])
@@ -345,6 +366,9 @@ class NmuxTUI:
     def _draw(self):
         self.scr.clear()
         max_y, max_x = self.scr.getmaxyx()
+
+        # _draw() 内で再利用するデータをキャッシュ（複数回の file I/O を防ぐ）
+        _cached_conv_sessions = _get_converse_sessions()
 
         # ── ヘッダー行 ─────────────────────────────────────
         api_on, _ = _check_api()
@@ -374,7 +398,7 @@ class NmuxTUI:
             if (p.get("process", "").lower().split("/")[-1] in _AI_PROCS)
         )
         running_conv_count = sum(
-            1 for s in _get_converse_sessions() if s["status"] == "running"
+            1 for s in _cached_conv_sessions if s["status"] == "running"
         )
         conv_part = "  会話: {}件".format(running_conv_count) if running_conv_count else ""
         agent_summary = " AI稼働: {}/{}{}".format(active, total, conv_part)
@@ -443,7 +467,7 @@ class NmuxTUI:
             div_line = "─" * min(max_x, 60)
 
             # ── アクティブな converse セッションがあれば優先表示 ──
-            conv_sessions    = _get_converse_sessions()
+            conv_sessions    = _cached_conv_sessions
             running_sessions = [s for s in conv_sessions if s["status"] == "running"]
 
             if running_sessions:
@@ -543,7 +567,7 @@ class NmuxTUI:
         # ── フッター（キー一覧） ────────────────────────────
         footer_y = max_y - 1
         conv_sessions_active = any(
-            s["status"] == "running" for s in _get_converse_sessions()
+            s["status"] == "running" for s in _cached_conv_sessions
         )
         stop_key = "  [s] 会話停止" if conv_sessions_active else ""
         keys = "  [q] 終了  [r] 即時更新  [Enter] このペインへ移動  [d] タスク一括送信  " \

@@ -321,13 +321,15 @@ cmd_wait() {
   esac
 
   _log INFO "wait target=${target} pattern=${pattern} timeout=${timeout}s then=${then_cmd:-none}"
-  local elapsed=0
-  while [ "${elapsed}" -lt "${timeout}" ]; do
+  # 0.1秒ポーリング（旧: 1秒）→ 最大10倍高速に検出
+  local elapsed_ms=0
+  local timeout_ms=$(( timeout * 1000 ))
+  while [ "${elapsed_ms}" -lt "${timeout_ms}" ]; do
     local out
     out=$(tmux capture-pane -t "${pid}" -p -S -10 2>/dev/null || true)
     if printf '%s\n' "${out}" | grep -qE "${pattern}"; then
       _set_mark "${pid}"
-      printf '検出: %s (%d秒後)\n' "${pattern}" "${elapsed}"
+      printf '検出: %s (%s秒後)\n' "${pattern}" "$(awk "BEGIN{printf \"%.1f\", ${elapsed_ms}/1000}")"
       # --then が指定されていればサブシェルで実行して終了
       if [ -n "${then_cmd}" ]; then
         _log INFO "wait --then 実行: ${then_cmd}"
@@ -335,10 +337,37 @@ cmd_wait() {
       fi
       return 0
     fi
-    sleep 1
-    elapsed=$((elapsed + 1))
+    sleep 0.1
+    elapsed_ms=$(( elapsed_ms + 100 ))
   done
   _err "タイムアウト: '${pattern}' が ${timeout}秒以内に現れませんでした"
+}
+
+# ── ping: エージェントの疎通確認 ────────────────────────────
+cmd_ping() {
+  # 使い方: ping <target> [timeout]
+  local target="${1:-}"
+  local timeout="${2:-5}"
+  [ -z "${target}" ] && _err "使い方: nmux-bridge ping <target> [timeout]"
+
+  local pid
+  pid=$(resolve_target "${target}")
+
+  local out
+  local elapsed_ms=0
+  local timeout_ms=$(( timeout * 1000 ))
+  while [ "${elapsed_ms}" -lt "${timeout_ms}" ]; do
+    out=$(tmux capture-pane -t "${pid}" -p -S -3 2>/dev/null || true)
+    if [ -n "${out}" ]; then
+      printf '✓ %s は応答しています (%s秒)\n' "${target}" \
+        "$(awk "BEGIN{printf \"%.1f\", ${elapsed_ms}/1000}")"
+      return 0
+    fi
+    sleep 0.1
+    elapsed_ms=$(( elapsed_ms + 100 ))
+  done
+  printf '✗ %s は応答しません (%d秒タイムアウト)\n' "${target}" "${timeout}" >&2
+  return 1
 }
 
 cmd_log() {
@@ -368,7 +397,8 @@ nmux-bridge — クロスペイン AI エージェント通信 CLI
   name <target> <label>             ペインにラベルを付ける
   resolve <label>                   ラベル → ペイン ID 解決
   id                                自分のペイン ID を表示
-  wait <target> [pattern] [timeout] [--then <cmd>]  パターン出現まで待機。検出後に --then コマンドをサブシェルで実行
+  wait <target> [pattern] [timeout] [--then <cmd>]  パターン出現まで待機（0.1秒ポーリング）
+  ping <target> [timeout]           エージェントの疎通確認（デフォルト: 5秒）
   log [N]                           ブリッジログ表示
 
 環境変数:
@@ -393,6 +423,7 @@ case "$1" in
   resolve) shift;       cmd_resolve "$@" ;;
   id)                   cmd_id ;;
   wait)    shift;       cmd_wait "$@" ;;
+  ping)    shift;       cmd_ping "$@" ;;
   log)     shift;       cmd_log "${1:-50}" ;;
   help|--help|-h)       cmd_help ;;
   *)

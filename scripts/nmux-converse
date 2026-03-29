@@ -439,10 +439,10 @@ _update_status()   { _conf_set "$(_sf "$1")" STATUS "$2" 2>/dev/null || true; }
 # _run_loop — 会話ループ本体
 # ============================================================
 _run_loop() {
-  # 引数: name turns timeout read_lines prompt interval ssh_port agent1 agent2 ...
+  # 引数: name turns timeout read_lines prompt interval ssh_port on_finish agent1 agent2 ...
   local name="$1" max_turns="$2" timeout="$3" read_lines="$4"
-  local prompt="$5" interval="$6" ssh_port="$7"
-  shift 7
+  local prompt="$5" interval="$6" ssh_port="$7" on_finish="$8"
+  shift 8
   export NMUX_SSH_PORT="${ssh_port}"
 
   local log_f pid_f
@@ -584,6 +584,14 @@ _run_loop() {
   _info "完了: ${turn} ターン"
   _update_status "${name}" "completed"
   rm -f "${pid_f}"
+
+  # --on-finish フックが指定されていれば実行
+  if [ -n "${on_finish}" ]; then
+    _info "on-finish フック実行: ${on_finish}"
+    export NMUX_SESSION_NAME="${name}"
+    export NMUX_TURNS_DONE="${turn}"
+    ( eval "${on_finish}" ) || _warn "on-finish フックがエラーで終了しました"
+  fi
 }
 
 # ============================================================
@@ -592,6 +600,7 @@ _run_loop() {
 cmd_start() {
   local name="" turns=10 timeout=120 read_lines=80
   local prompt='[$%#>❯]' interval=1 daemon=0 message="" ssh_port=22
+  local on_finish=""
   local agents=()
 
   while [ $# -gt 0 ]; do
@@ -604,6 +613,7 @@ cmd_start() {
       --interval)      interval="$2";    shift 2 ;;
       --ssh-port)      ssh_port="$2";    shift 2 ;;
       --daemon)        daemon=1;         shift ;;
+      --on-finish)     on_finish="$2";   shift 2 ;;
       -m|--message)    message="$2";     shift 2 ;;
       -*)              _err "不明なオプション: $1" ;;
       *)               agents+=("$1");   shift ;;
@@ -655,7 +665,7 @@ CONF
 
   if [ "${daemon}" = "1" ]; then
     _run_loop "${name}" "${turns}" "${timeout}" "${read_lines}" \
-      "${prompt}" "${interval}" "${ssh_port}" "${agents[@]}" \
+      "${prompt}" "${interval}" "${ssh_port}" "${on_finish}" "${agents[@]}" \
       >> "${log_f}" 2>&1 &
     printf '%d\n' $! > "${pid_f}"
     _info "バックグラウンド起動 (PID: $!)"
@@ -663,7 +673,7 @@ CONF
     _info "停止: nmux-converse stop ${name}"
   else
     _run_loop "${name}" "${turns}" "${timeout}" "${read_lines}" \
-      "${prompt}" "${interval}" "${ssh_port}" "${agents[@]}"
+      "${prompt}" "${interval}" "${ssh_port}" "${on_finish}" "${agents[@]}"
   fi
 }
 
@@ -792,6 +802,7 @@ start オプション:
   --interval <sec>       ターン間の待機秒数（デフォルト: 1）
   --ssh-port <port>      リモートエージェントのデフォルトSSHポート（デフォルト: 22）
   --daemon               バックグラウンドで実行
+  --on-finish <cmd>      会話完了時に実行するコマンド（環境変数: NMUX_SESSION_NAME, NMUX_TURNS_DONE）
   -m, --message <text>   会話の初期トピック
 
 エージェントの指定:
