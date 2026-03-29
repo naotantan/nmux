@@ -1,0 +1,26 @@
+{
+  "version": "1.0",
+  "mappings": {
+    "brainstorming": {
+      "keywords": ["設計", "アーキテクチャ", "提案", "アイデア", "ブレスト", "どう思う", "design", "brainstorm"],
+      "skill_path": "brainstorming"
+    },
+    "writing-plans": {
+      "keywords": ["実装計画", "タスク分解", "ステップ", "手順", "計画", "plan", "roadmap"],
+      "skill_path": "writing-plans"
+    },
+    "code-reviewer": {
+      "keywords": ["レビュー", "コード確認", "品質", "バグ", "チェック", "review", "lint"],
+      "skill_path": "code-reviewer"
+    },
+    "research": {
+      "keywords": ["調査", "調べて", "比較", "リサーチ", "市場", "research", "investigate"],
+      "skill_path": "research"
+    },
+    "weekly-report": {
+      "keywords": ["週次", "週報", "サマリー", "振り返り", "週まとめ", "weekly", "summary"],
+      "skill_path": "weekly-report"
+    }
+  },
+  "skip": []
+}
