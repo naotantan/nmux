@@ -109,6 +109,23 @@ require_brew() {
   fi
 }
 
+# Python 3.6+ の存在確認（nmux-dispatch に必要）
+# 存在すれば 0、なければ 1 を返す
+check_python3() {
+  local py
+  for py in python3 python; do
+    if command -v "${py}" >/dev/null 2>&1; then
+      local ver
+      ver=$("${py}" -c "import sys; print(sys.version_info >= (3,6))" 2>/dev/null || true)
+      if [ "${ver}" = "True" ]; then
+        debug "Python 3.6+ 確認済み: $(${py} --version 2>&1)"
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
 # ============================================================
 # クリップボード検出
 # ============================================================
@@ -413,6 +430,16 @@ install_core() {
     info "nmux-remote をダウンロード中..."
     download "${BASE_URL}/scripts/nmux-remote" "${BIN_DIR}/nmux-remote"
     chmod +x "${BIN_DIR}/nmux-remote"
+  fi
+
+  # nmux-dispatch（Python 3.6+ が必要）
+  if check_python3; then
+    info "nmux-dispatch をダウンロード中..."
+    download "${BASE_URL}/scripts/nmux-dispatch" "${BIN_DIR}/nmux-dispatch"
+    chmod +x "${BIN_DIR}/nmux-dispatch"
+  else
+    warn "Python 3.6+ が見つかりません。nmux-dispatch をスキップします。"
+    warn "インストール後に手動で追加する場合: brew install python3 (macOS) または apt-get install python3 (Linux)"
   fi
 
   # nmux CLI 本体

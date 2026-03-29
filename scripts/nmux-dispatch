@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+# nmux-dispatch — JSON タスク分散実行スクリプト
+# 依存関係を解決しながら複数エージェントへタスクを分散する
+# Python 3.6+ / 標準ライブラリのみ
+# https://github.com/naotantan/nmux
+import json
+import os
+import subprocess
+import sys
+import threading
+from collections import defaultdict, deque
+
+# ── 定数 ──────────────────────────────────────────────────────
+DEFAULT_TIMEOUT    = 120   # 秒
+DEFAULT_ON_FAILURE = "abort"
+NMUX_BRIDGE        = os.path.join(os.environ.get("HOME", ""), ".nmux", "bin", "nmux-bridge")
+
+# ── 色付き出力 ────────────────────────────────────────────────
+RED    = "\033[0;31m"
+GREEN  = "\033[0;32m"
+YELLOW = "\033[0;33m"
+BLUE   = "\033[0;34m"
+NC     = "\033[0m"
+
+def _log(color: str, prefix: str, msg: str) -> None:
+    print(f"{color}[nmux-dispatch]{NC} {prefix} {msg}", flush=True)
+
+def info(msg: str)  -> None: _log(GREEN,  "", msg)
+def warn(msg: str)  -> None: _log(YELLOW, "warn:", msg)
+def error(msg: str) -> None: _log(RED,    "error:", msg); sys.exit(1)
+def debug(msg: str) -> None:
+    if os.environ.get("NMUX_DEBUG") == "1":
+        _log(BLUE, "debug:", msg)
+
+# ── スキーマ検証 ──────────────────────────────────────────────
+REQUIRED_FIELDS = {"id", "agent", "message"}
+
+def validate_schema(data: dict) -> None:
+    """タスク定義 JSON のスキーマを検証する。問題があれば ValueError を送出。"""
+    if not isinstance(data, dict):
+        raise ValueError("トップレベルはオブジェクトである必要があります")
+    tasks = data.get("tasks")
+    if not isinstance(tasks, list) or len(tasks) == 0:
+        raise ValueError("'tasks' は 1 件以上の配列である必要があります")
+
+    seen_ids: set = set()
+    for i, task in enumerate(tasks):
+        if not isinstance(task, dict):
+            raise ValueError(f"tasks[{i}]: オブジェクトである必要があります")
+        for field in REQUIRED_FIELDS:
+            if field not in task:
+                raise ValueError(f"tasks[{i}]: 必須フィールド '{field}' がありません")
+            if not isinstance(task[field], str) or not task[field].strip():
+                raise ValueError(f"tasks[{i}]: '{field}' は空でない文字列である必要があります")
+        tid = task["id"]
+        if tid in seen_ids:
+            raise ValueError(f"tasks[{i}]: id '{tid}' が重複しています")
+        seen_ids.add(tid)
+
+        # オプションフィールドの型チェック
+        if "timeout" in task:
+            if not isinstance(task["timeout"], int) or task["timeout"] <= 0:
+                raise ValueError(f"tasks[{i}] '{tid}': timeout は正の整数である必要があります")
+        if "on_failure" in task:
+            if task["on_failure"] not in ("abort", "continue"):
+                raise ValueError(
+                    f"tasks[{i}] '{tid}': on_failure は 'abort' または 'continue' である必要があります"
+                )
+        if "depends_on" in task:
+            if not isinstance(task["depends_on"], list):
+                raise ValueError(f"tasks[{i}] '{tid}': depends_on は配列である必要があります")
+            for dep in task["depends_on"]:
+                if not isinstance(dep, str):
+                    raise ValueError(f"tasks[{i}] '{tid}': depends_on の要素は文字列である必要があります")
+
+    # depends_on が存在する ID を参照しているか確認
+    for task in tasks:
+        for dep in task.get("depends_on", []):
+            if dep not in seen_ids:
+                raise ValueError(
+                    f"task '{task['id']}': depends_on に未定義の id '{dep}' が含まれています"
+                )
+
+    # 循環依存チェック（トポロジカルソート）
+    _check_cycle(tasks)
+
+
+def _check_cycle(tasks: list) -> None:
+    """Kahn のアルゴリズムで循環依存を検出する。"""
+    in_degree: dict = defaultdict(int)
+    graph: dict     = defaultdict(list)
+    ids = {t["id"] for t in tasks}
+    for task in tasks:
+        tid = task["id"]
+        for dep in task.get("depends_on", []):
+            graph[dep].append(tid)
+            in_degree[tid] += 1
+
+    queue = deque(tid for tid in ids if in_degree[tid] == 0)
+    visited = 0
+    while queue:
+        node = queue.popleft()
+        visited += 1
+        for neighbor in graph[node]:
+            in_degree[neighbor] -= 1
+            if in_degree[neighbor] == 0:
+                queue.append(neighbor)
+
+    if visited != len(ids):
+        raise ValueError("tasks に循環依存があります（依存グラフにサイクルが存在します）")
+
+
+# ── トポロジカルソート（実行順決定）────────────────────────────
+def topo_sort(tasks: list) -> list:
+    """依存関係を考慮した実行順リストを返す。並列可能なタスクは同一グループに入る。"""
+    id_to_task = {t["id"]: t for t in tasks}
+    remaining  = set(id_to_task.keys())
+    completed: set  = set()
+    result: list    = []
+
+    while remaining:
+        # 依存が全て完了しているタスクを並列グループとして取り出す
+        ready = [
+            tid for tid in remaining
+            if all(dep in completed for dep in id_to_task[tid].get("depends_on", []))
+        ]
+        if not ready:
+            # ここには来ないはず（循環チェック済み）
+            raise RuntimeError("依存解決が停止しました（内部エラー）")
+        result.append(ready)
+        for tid in ready:
+            remaining.remove(tid)
+            completed.add(tid)
+
+    return result  # [[並列グループ1], [並列グループ2], ...]
+
+
+# ── nmux-bridge 呼び出し ──────────────────────────────────────
+def _bridge(args: list, check: bool = True) -> subprocess.CompletedProcess:
+    """nmux-bridge を呼び出す。check=True の場合、失敗で例外を送出。"""
+    cmd = [NMUX_BRIDGE] + args
+    debug(f"bridge: {' '.join(cmd)}")
+    return subprocess.run(cmd, check=check, capture_output=True, text=True)
+
+
+def run_task(task: dict, defaults: dict, abort_event: threading.Event) -> bool:
+    """
+    1 タスクを実行する。
+    1. nmux-bridge message で指示を送信
+    2. done_pattern があれば nmux-bridge wait で完了を待つ
+    成功なら True、失敗なら False を返す。
+    """
+    tid        = task["id"]
+    agent      = task["agent"]
+    message    = task["message"]
+    pattern    = task.get("done_pattern", "")
+    timeout    = task.get("timeout",    defaults.get("timeout",    DEFAULT_TIMEOUT))
+    on_failure = task.get("on_failure", defaults.get("on_failure", DEFAULT_ON_FAILURE))
+
+    if abort_event.is_set():
+        warn(f"[{tid}] abort フラグが立っているためスキップ")
+        return False
+
+    info(f"[{tid}] 開始 → agent={agent}")
+    try:
+        # read → message（Read Guard のため先に read が必要）
+        _bridge(["read", agent, "1"])
+        _bridge(["message", agent, message])
+        info(f"[{tid}] メッセージ送信完了")
+
+        if pattern:
+            info(f"[{tid}] 完了待機: pattern='{pattern}' timeout={timeout}s")
+            result = _bridge(["wait", agent, pattern, str(timeout)], check=False)
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"wait がタイムアウト / エラー: {result.stderr.strip()}"
+                )
+            info(f"[{tid}] 完了検出")
+        else:
+            info(f"[{tid}] done_pattern 未指定のため完了待機なし")
+
+    except Exception as exc:
+        warn(f"[{tid}] 失敗: {exc}")
+        if on_failure == "abort":
+            abort_event.set()
+        return False
+
+    info(f"[{tid}] ✓ 成功")
+    return True
+
+
+# ── メイン実行 ────────────────────────────────────────────────
+def dispatch(data: dict, dry_run: bool = False) -> int:
+    """
+    タスクを依存順に並列実行する。
+    戻り値: 成功数（全タスク数と一致すれば全成功）
+    """
+    defaults = data.get("defaults", {})
+    tasks    = data["tasks"]
+    groups   = topo_sort(tasks)
+    id_to_task = {t["id"]: t for t in tasks}
+
+    total    = len(tasks)
+    success  = 0
+    abort_event = threading.Event()
+
+    info(f"タスク数: {total} / グループ数: {len(groups)}")
+    if dry_run:
+        info("【dry-run】実際の送信は行いません")
+
+    for g_idx, group in enumerate(groups, 1):
+        if abort_event.is_set():
+            warn(f"グループ {g_idx} 以降を abort のためスキップ")
+            break
+
+        info(f"グループ {g_idx}/{len(groups)}: {group}")
+
+        if dry_run:
+            for tid in group:
+                t = id_to_task[tid]
+                print(
+                    f"  [dry-run] id={t['id']} agent={t['agent']}"
+                    f" timeout={t.get('timeout', defaults.get('timeout', DEFAULT_TIMEOUT))}s"
+                    f" on_failure={t.get('on_failure', defaults.get('on_failure', DEFAULT_ON_FAILURE))}"
+                    f" depends_on={t.get('depends_on', [])}"
+                )
+            success += len(group)
+            continue
+
+        if len(group) == 1:
+            ok = run_task(id_to_task[group[0]], defaults, abort_event)
+            if ok:
+                success += 1
+        else:
+            # 並列実行
+            results: dict = {}
+            threads = []
+            for tid in group:
+                def _worker(task=id_to_task[tid]):
+                    results[task["id"]] = run_task(task, defaults, abort_event)
+                t = threading.Thread(target=_worker, daemon=True)
+                threads.append(t)
+                t.start()
+            for t in threads:
+                t.join()
+            for tid in group:
+                if results.get(tid):
+                    success += 1
+
+    if dry_run:
+        info(f"dry-run 完了: {total} タスクの実行計画を確認しました")
+    else:
+        info(f"完了: {success}/{total} タスク成功")
+
+    return success
+
+
+# ── エントリーポイント ─────────────────────────────────────────
+def main() -> None:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="nmux-dispatch",
+        description="JSON タスク定義ファイルに従い複数エージェントへタスクを分散実行する",
+    )
+    parser.add_argument("tasks_file", help="タスク定義 JSON ファイルのパス")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="実際の送信を行わず実行計画のみ表示する",
+    )
+    args = parser.parse_args()
+
+    # JSON 読み込み
+    path = args.tasks_file
+    if not os.path.isfile(path):
+        error(f"ファイルが見つかりません: {path}")
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as exc:
+        error(f"JSON パースエラー: {exc}")
+
+    # スキーマ検証
+    try:
+        validate_schema(data)
+    except ValueError as exc:
+        error(f"スキーマエラー: {exc}")
+
+    # 実行
+    total   = len(data["tasks"])
+    success = dispatch(data, dry_run=args.dry_run)
+
+    if not args.dry_run and success < total:
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

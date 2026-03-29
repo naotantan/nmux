@@ -281,9 +281,29 @@ cmd_id() {
 }
 
 cmd_wait() {
+  # 使い方: wait <target> <pattern> [timeout] [--then <command>]
   local target="$1"
   local pattern="${2:-[$]}"
   local timeout="${3:-30}"
+  local then_cmd=""
+
+  # --then <command> を引数リストから取り出す
+  local args=("$@")
+  local n=${#args[@]}
+  local i=0
+  while [ "${i}" -lt "${n}" ]; do
+    if [ "${args[${i}]}" = "--then" ]; then
+      i=$((i + 1))
+      if [ "${i}" -lt "${n}" ]; then
+        then_cmd="${args[${i}]}"
+      else
+        _err "wait --then: コマンドを指定してください"
+      fi
+      break
+    fi
+    i=$((i + 1))
+  done
+
   local pid
   pid=$(resolve_target "${target}")
 
@@ -291,7 +311,7 @@ cmd_wait() {
     ''|*[!0-9]*) _err "タイムアウトは正の整数で指定してください: ${timeout}" ;;
   esac
 
-  _log INFO "wait target=${target} pattern=${pattern} timeout=${timeout}s"
+  _log INFO "wait target=${target} pattern=${pattern} timeout=${timeout}s then=${then_cmd:-none}"
   local elapsed=0
   while [ "${elapsed}" -lt "${timeout}" ]; do
     local out
@@ -299,6 +319,11 @@ cmd_wait() {
     if printf '%s\n' "${out}" | grep -qE "${pattern}"; then
       _set_mark "${pid}"
       printf '検出: %s (%d秒後)\n' "${pattern}" "${elapsed}"
+      # --then が指定されていればサブシェルで実行して終了
+      if [ -n "${then_cmd}" ]; then
+        _log INFO "wait --then 実行: ${then_cmd}"
+        ( eval "${then_cmd}" )
+      fi
       return 0
     fi
     sleep 1
@@ -334,7 +359,7 @@ nmux-bridge — クロスペイン AI エージェント通信 CLI
   name <target> <label>             ペインにラベルを付ける
   resolve <label>                   ラベル → ペイン ID 解決
   id                                自分のペイン ID を表示
-  wait <target> [pattern] [timeout] パターン出現まで待機
+  wait <target> [pattern] [timeout] [--then <cmd>]  パターン出現まで待機。検出後に --then コマンドをサブシェルで実行
   log [N]                           ブリッジログ表示
 
 環境変数:
