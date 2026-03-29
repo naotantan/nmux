@@ -262,6 +262,147 @@ for name, info in data.get('mappings', {}).items():
 PYEOF
 }
 
+# ── Feature B: エージェント自動増設 ──────────────────────────
+# 複数条件のスコアを計算して増設必要性を返す
+# 引数: 直近タイムアウト数 直近失敗数 最大応答長 最小応答長 現在ターン 最大ターン
+_score_scale_up() {
+  local timeouts="$1" failures="$2" resp_max="$3" resp_min="$4"
+  local current_turn="$5" max_turns="$6"
+  local score=0
+  [ "${timeouts}" -gt 0 ] && score=$(( score + 3 ))  # タイムアウト: +3
+  [ "${failures}" -gt 0 ] && score=$(( score + 2 ))  # 失敗: +2
+  # 負荷不均衡: 最大/最小比 > 3 なら +1
+  if [ "${resp_min}" -gt 0 ]; then
+    local ratio=$(( resp_max / resp_min ))
+    [ "${ratio}" -gt 3 ] && score=$(( score + 1 ))
+  fi
+  # ターン節目 (50% or 75%): +1
+  local half=$(( max_turns / 2 ))
+  local three_q=$(( max_turns * 3 / 4 ))
+  if [ "${current_turn}" -eq "${half}" ] || [ "${current_turn}" -eq "${three_q}" ]; then
+    score=$(( score + 1 ))
+  fi
+  printf '%d' "${score}"
+}
+
+# スコアからAI推奨追加数を計算する（最大3）
+_calc_recommended_count() {
+  local timeouts="$1" failures="$2"
+  local count=1
+  [ "${timeouts}" -gt 1 ] && count=$(( count + 1 ))
+  [ "${failures}" -gt 1 ] && count=$(( count + 1 ))
+  [ "${count}" -gt 3 ] && count=3
+  printf '%d' "${count}"
+}
+
+# 既存ラベルと重複しない次の連番ラベルを返す（agent-c, agent-d...）
+_next_agent_label() {
+  local existing="$*"
+  local suffix
+  for suffix in c d e f g h i j k l m n o p q r s t u v w x y z aa ab ac ad ae; do
+    local label="agent-${suffix}"
+    local found=0
+    for a in ${existing}; do [ "${a}" = "${label}" ] && found=1 && break; done
+    [ "${found}" = "0" ] && printf '%s' "${label}" && return
+  done
+  printf ''
+}
+
+# tmuxペインを新規作成してラベルを登録する
+_create_pane_for_agent() {
+  local label="$1"
+  if [ -z "${TMUX:-}" ]; then
+    _warn "tmux セッション外のためペイン自動作成をスキップしました"
+    _warn "手動で tmux ペインを開き、nmux-bridge name <pane-id> ${label} を実行してください"
+    return 1
+  fi
+  local pane_id
+  pane_id=$(tmux split-window -P -F '#{pane_id}' 2>/dev/null) || {
+    _warn "tmux split-window に失敗しました: ${label}"
+    return 1
+  }
+  "${BRIDGE}" name "${pane_id}" "${label}" 2>/dev/null || {
+    _warn "nmux-bridge name 登録に失敗しました: ${label} (${pane_id})"
+    return 1
+  }
+  _info "ペイン '${label}' を作成しました (${pane_id})"
+}
+
+# count 個のエージェントを自動採番して追加する
+_add_agents() {
+  local name="$1" count="$2"
+  shift 2
+  local current_agents="$*"
+  local added=0
+  local i
+  for i in $(seq 1 "${count}"); do
+    local label
+    label=$(_next_agent_label ${current_agents})
+    if [ -z "${label}" ]; then
+      _warn "ラベルの採番上限（agent-ae）に達しました"
+      break
+    fi
+    # ラベルが未登録ならペイン作成
+    if ! _agent_exists "${label}" 2>/dev/null; then
+      _create_pane_for_agent "${label}" || continue
+    fi
+    # セッションに追加
+    local cur
+    cur=$(_get_agents "${name}")
+    _conf_set "$(_sf "${name}")" AGENTS "${cur} ${label}" && \
+      _info "'${label}' を追加しました" || continue
+    current_agents="${current_agents} ${label}"
+    added=$(( added + 1 ))
+  done
+  [ "${added}" -gt 0 ] && _info "計 ${added} 名のエージェントを追加しました"
+}
+
+# 増設提案ダイアログ: ユーザに数・上限を聞いて _add_agents を呼ぶ
+_recommend_scale_up() {
+  local name="$1" recommended="$2"
+  shift 2
+  local current_agents="$*"
+
+  # 現在のエージェント数
+  local current_count=0
+  for a in ${current_agents}; do current_count=$(( current_count + 1 )); done
+
+  _sep
+  printf "${YELLOW}[自動増設の提案]${NC}\n"
+  printf "現在の会話負荷が高まっています。\n"
+  printf "エージェントを追加すると効率が上がる可能性があります。\n\n"
+  printf "AIの推奨追加数: %d名\n\n" "${recommended}"
+  printf "何名追加しますか？ (0でキャンセル): "
+
+  local count
+  read -r count </dev/tty 2>/dev/null || count="0"
+  [ -z "${count}" ] && count="0"
+  printf '%s' "${count}" | grep -qE '^[0-9]+$' || { _info "入力が無効です。キャンセルします"; return; }
+  [ "${count}" = "0" ] && { _info "増設をキャンセルしました"; return; }
+
+  local max_disp="${_SCALE_MAX:-未設定}"
+  printf "最大何名まで許可しますか？ (現在の上限: %s): " "${max_disp}"
+  local max_input
+  read -r max_input </dev/tty 2>/dev/null || max_input="${_SCALE_MAX:-99}"
+  [ -z "${max_input}" ] && max_input="${_SCALE_MAX:-99}"
+  printf '%s' "${max_input}" | grep -qE '^[0-9]+$' || max_input="${_SCALE_MAX:-99}"
+  _SCALE_MAX="${max_input}"
+
+  # 上限チェック
+  local after=$(( current_count + count ))
+  if [ "${after}" -gt "${_SCALE_MAX}" ]; then
+    local allowed=$(( _SCALE_MAX - current_count ))
+    if [ "${allowed}" -le 0 ]; then
+      _info "上限 (${_SCALE_MAX}名) に達しています。増設できません"
+      return
+    fi
+    _info "上限に合わせて ${allowed} 名のみ追加します"
+    count="${allowed}"
+  fi
+
+  _add_agents "${name}" "${count}" ${current_agents}
+}
+
 # ── 応答抽出: 送信メッセージ以降、最後のプロンプト行を除く ──
 # #3: tmpfile を使わずパイプで処理（軽量化）
 # #3: 同一メッセージが複数回出現する場合、最後のマッチ以降を使用する
