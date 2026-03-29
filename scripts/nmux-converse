@@ -777,6 +777,7 @@ nmux-converse — AI-to-AI リアルタイム会話オーケストレーター
   remove    実行中セッションからエージェントを削除する（次ターンから反映）
   list      全セッションを一覧表示（● = 稼働中）
   log       会話ログを表示する
+  skill-map スキルマッピング一覧を表示する
 
 start オプション:
   -n, --name <name>      セッション名（デフォルト: sess-HHMMSS）
@@ -840,6 +841,7 @@ case "$1" in
   remove)         shift; cmd_remove "$@" ;;
   list)                  cmd_list ;;
   log)            shift; cmd_log "$@" ;;
+  skill-map)             cmd_skill_map ;;
   help|--help|-h)        cmd_help ;;
   # 既知コマンド以外 → start の省略形（agent1 agent2 ... "topic"）
   *)                     cmd_start "$@" ;;

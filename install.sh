@@ -477,6 +477,12 @@ install_core() {
   download "${BASE_URL}/scripts/nmux-converse" "${BIN_DIR}/nmux-converse"
   chmod +x "${BIN_DIR}/nmux-converse"
 
+  # skill-map.json を配置（既存ファイルは上書きしない）
+  if [ ! -f "${NMUX_DIR}/skill-map.json" ]; then
+    download "${BASE_URL}/scripts/skill-map.json" "${NMUX_DIR}/skill-map.json"
+    info "skill-map.json を配置しました: ${NMUX_DIR}/skill-map.json"
+  fi
+
   # nmux CLI 本体
   info "nmux CLI をインストール中..."
   download "${BASE_URL}/install.sh" "${BIN_DIR}/nmux"
@@ -614,6 +620,11 @@ cmd_update() {
   # nmux-converse（bash スクリプト・常時インストール）
   download "${BASE_URL}/scripts/nmux-converse" "${BIN_DIR}/nmux-converse"
   chmod +x "${BIN_DIR}/nmux-converse"
+
+  # skill-map.json（存在しない場合のみ配置）
+  if [ ! -f "${NMUX_DIR}/skill-map.json" ]; then
+    download "${BASE_URL}/scripts/skill-map.json" "${NMUX_DIR}/skill-map.json"
+  fi
 
   download "${BASE_URL}/install.sh" "${BIN_DIR}/nmux"
   chmod +x "${BIN_DIR}/nmux"
