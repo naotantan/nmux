@@ -4,7 +4,7 @@
 # https://github.com/naotantan/nmux
 set -euo pipefail
 
-NMUX_VERSION="1.1.0"
+NMUX_VERSION="2.0.0"
 REPO_OWNER="naotantan"
 REPO_NAME="nmux"
 BRANCH="main"
@@ -358,7 +358,7 @@ input_remote_conf() {
   info "SSH 接続テスト中..."
   if ssh -q \
        -o ConnectTimeout=10 \
-       -o StrictHostKeyChecking=no \
+       -o StrictHostKeyChecking=accept-new \
        -p "${REMOTE_PORT}" \
        "${REMOTE_USER}@${REMOTE_HOST}" \
        'true' 2>/dev/null; then
@@ -590,6 +590,16 @@ cmd_update() {
     chmod +x "${BIN_DIR}/nmux-remote"
   fi
 
+  # Python スクリプト群（Python 3.6+ がある場合のみ更新）
+  if check_python3; then
+    download "${BASE_URL}/scripts/nmux-dispatch" "${BIN_DIR}/nmux-dispatch"
+    chmod +x "${BIN_DIR}/nmux-dispatch"
+    download "${BASE_URL}/scripts/nmux-api"      "${BIN_DIR}/nmux-api"
+    chmod +x "${BIN_DIR}/nmux-api"
+    download "${BASE_URL}/scripts/nmux-tui"      "${BIN_DIR}/nmux-tui"
+    chmod +x "${BIN_DIR}/nmux-tui"
+  fi
+
   download "${BASE_URL}/install.sh" "${BIN_DIR}/nmux"
   chmod +x "${BIN_DIR}/nmux"
 
@@ -637,6 +647,11 @@ EOF
 
 cmd_uninstall() {
   info "nmux をアンインストール中..."
+
+  # nmux-api 停止（daemon / integrated どちらでも）
+  if [ -x "${BIN_DIR}/nmux-api" ]; then
+    "${BIN_DIR}/nmux-api" stop 2>/dev/null || true
+  fi
 
   # ハートビート停止
   if [ -x "${BIN_DIR}/nmux-heartbeat" ]; then
@@ -707,6 +722,18 @@ cmd_status() {
   fi
 
   printf '  ハートビート:    %s\n' "${hb_status}"
+
+  # nmux-api 稼働状況
+  local api_status="停止"
+  if [ -f "${STATE_DIR}/api.pid" ]; then
+    local api_pid
+    api_pid=$(cat "${STATE_DIR}/api.pid")
+    if kill -0 "${api_pid}" 2>/dev/null; then
+      api_status="稼働中 (PID: ${api_pid})"
+    fi
+  fi
+  printf '  nmux-api:        %s\n' "${api_status}"
+
   printf '  ログ:            %s\n' "${LOG_DIR}"
   printf '\n'
 }
