@@ -146,15 +146,22 @@ class NmuxTUI:
         api_on, _ = _check_api()
         ts    = time.strftime("%Y-%m-%d %H:%M:%S")
         api_s = "●  :{}".format(self.api_port) if api_on else "○  (off)"
-        header = " nmux dashboard "
-        meta   = "  {}   api: {}  ".format(ts, api_s)
+        # API ON/OFF で色を分ける（_C_API_ON: 緑 / _C_API_OFF: 赤）
+        api_color = curses.color_pair(_C_API_ON) if api_on else curses.color_pair(_C_API_OFF)
+        header      = " nmux dashboard "
+        meta_prefix = "  {}   api: ".format(ts)
+        meta_suffix = "  "
         _safe_addstr(self.scr, 0, 0, header, curses.color_pair(_C_HEADER) | curses.A_BOLD)
-        _safe_addstr(self.scr, 0, len(header), meta[:max_x - len(header)],
-                     curses.color_pair(_C_HEADER))
+        x = len(header)
+        _safe_addstr(self.scr, 0, x, meta_prefix[:max_x - x], curses.color_pair(_C_HEADER))
+        x += len(meta_prefix)
+        _safe_addstr(self.scr, 0, x, api_s[:max(0, max_x - x)], api_color)
+        x += len(api_s)
+        _safe_addstr(self.scr, 0, x, meta_suffix[:max(0, max_x - x)], curses.color_pair(_C_HEADER))
+        x += len(meta_suffix)
         # 残幅を埋める
-        fill = max(0, max_x - len(header) - len(meta))
-        _safe_addstr(self.scr, 0, len(header) + len(meta),
-                     " " * fill, curses.color_pair(_C_HEADER))
+        fill = max(0, max_x - x)
+        _safe_addstr(self.scr, 0, x, " " * fill, curses.color_pair(_C_HEADER))
 
         # ── カラムヘッダー ──────────────────────────────────
         col_w = {"target": 14, "label": 10, "process": 10}

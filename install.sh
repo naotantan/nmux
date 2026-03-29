@@ -294,6 +294,12 @@ save_conf() {
 NMUX_MODE="${NMUX_MODE:-standalone}"
 NMUX_HEARTBEAT_INTERVAL="${NMUX_HEARTBEAT_INTERVAL:-1}"
 
+# API サーバー設定（nmux-api）
+NMUX_API_MODE="${NMUX_API_MODE:-integrated}"
+NMUX_API_HOST="${NMUX_API_HOST:-127.0.0.1}"
+NMUX_API_PORT="${NMUX_API_PORT:-8765}"
+NMUX_API_TOKEN="${NMUX_API_TOKEN:-}"
+
 # クロスマシン設定（モード: crossmachine のみ使用）
 REMOTE_HOST="${REMOTE_HOST:-}"
 REMOTE_USER="${REMOTE_USER:-}"
