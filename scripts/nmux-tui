@@ -95,7 +95,7 @@ _PROMPT_RE = re.compile(
     r'|.*\[q\]\s*Quit.*'                      # TUI フッター（英語）
     r'|^\s*$'                                  # 空行
     r'|^.*nmux_dashboard.*$'                   # TUI ヘッダー行
-    r'|^TARGET\s+LABEL.*$'                     # TUI カラムヘッダー
+    r'|^TARGET\s+LABEL.*$|^場所\(tmux\)\s+名前.*$'  # TUI カラムヘッダー
     r'|^[─━─]+$'                              # TUI 区切り線
 )
 
@@ -251,11 +251,11 @@ class NmuxTUI:
         # ── ヘッダー行 ─────────────────────────────────────
         api_on, _ = _check_api()
         ts    = time.strftime("%Y-%m-%d %H:%M:%S")
-        api_s = "●  :{}".format(self.api_port) if api_on else "○  (off)"
+        api_s = "●  稼働中 (:{}  )".format(self.api_port) if api_on else "○  停止中"
         # API ON/OFF で色を分ける（_C_API_ON: 緑 / _C_API_OFF: 赤）
         api_color = curses.color_pair(_C_API_ON) if api_on else curses.color_pair(_C_API_OFF)
         header      = " nmux dashboard "
-        meta_prefix = "  {}   api: ".format(ts)
+        meta_prefix = "  {}   REST API: ".format(ts)
         meta_suffix = "  "
         _safe_addstr(self.scr, 0, 0, header, curses.color_pair(_C_HEADER) | curses.A_BOLD)
         x = len(header)
@@ -276,7 +276,7 @@ class NmuxTUI:
             1 for p in self.panes
             if (p.get("process", "").lower().split("/")[-1] in _AI_PROCS)
         )
-        agent_summary = " agents: {}/{}".format(active, total)
+        agent_summary = " AI稼働: {}/{} エージェント".format(active, total)
         _safe_addstr(self.scr, 0, max(0, max_x - len(agent_summary) - 2),
                      agent_summary[:max_x], curses.color_pair(_C_HEADER))
 
@@ -284,10 +284,10 @@ class NmuxTUI:
         col_w = {"target": 14, "label": 10, "status": 8}
         out_w = max(10, max_x - col_w["target"] - col_w["label"] - col_w["status"] - 4)
         fmt   = "{:<{}} {:<{}} {:<{}} {:<{}}".format(
-            "TARGET",  col_w["target"],
-            "LABEL",   col_w["label"],
-            "STATUS",  col_w["status"],
-            "LAST OUTPUT", out_w,
+            "場所(tmux)",  col_w["target"],
+            "名前",        col_w["label"],
+            "状態",        col_w["status"],
+            "最新の出力",  out_w,
         )
         _safe_addstr(self.scr, 1, 0, fmt[:max_x], curses.A_BOLD)
 
@@ -367,7 +367,7 @@ class NmuxTUI:
 
         # ── フッター（キー一覧） ────────────────────────────
         footer_y = max_y - 1
-        keys = "  [q] 終了  [r] 更新  [Enter] ペイン選択  [d] dispatch  " \
+        keys = "  [q] 終了  [r] 画面更新  [Enter] このペインへ移動  [d] タスク一括送信  " \
                "[↑↓] 移動  更新間隔: {}s".format(self.interval)
         _safe_addstr(self.scr, footer_y, 0,
             keys[:max_x], curses.color_pair(_C_KEY))
@@ -411,7 +411,7 @@ class NmuxTUI:
 
     # ── dispatch ファイル指定ダイアログ ──────────────────────
     def _dispatch_dialog(self):
-        prompt = " dispatch: JSON ファイルパスを入力 (ESC でキャンセル): "
+        prompt = " タスク一括送信: JSON ファイルパスを入力 (ESC でキャンセル): "
         path = self._get_user_input(prompt)
         if path and path.strip():
             self._run_dispatch(path.strip())
