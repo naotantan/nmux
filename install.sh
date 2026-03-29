@@ -562,19 +562,25 @@ cmd_update() {
   info "nmux を更新中... (現在: v${current_ver})"
   mkdir -p "${NMUX_DIR}" "${BIN_DIR}" "${BACKUP_DIR}" "${LOG_DIR}" "${STATE_DIR}"
 
-  local tmp_ver
+  # VERSION ファイルを soft-download（失敗時は exit せず強制更新へ）
+  # download() は失敗時に error() → exit 1 するため直接 curl/wget を使う
+  local tmp_ver remote_ver
   tmp_ver=$(mktemp)
-  if download "${BASE_URL}/VERSION" "${tmp_ver}" 2>/dev/null; then
-    local remote_ver
-    remote_ver=$(cat "${tmp_ver}")
-    rm -f "${tmp_ver}"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "${BASE_URL}/VERSION" -o "${tmp_ver}" 2>/dev/null
+  else
+    wget -qO "${tmp_ver}" "${BASE_URL}/VERSION" 2>/dev/null || true
+  fi
+  remote_ver=$(cat "${tmp_ver}" 2>/dev/null | tr -d '[:space:]' || true)
+  rm -f "${tmp_ver}"
+
+  if [ -n "${remote_ver}" ]; then
     if [ "${current_ver}" = "${remote_ver}" ]; then
       info "すでに最新バージョン (v${current_ver}) です。"
       return 0
     fi
     info "v${current_ver} → v${remote_ver} に更新します..."
   else
-    rm -f "${tmp_ver}"
     warn "バージョン確認に失敗しました。強制更新します..."
   fi
 
@@ -673,8 +679,11 @@ cmd_uninstall() {
   fi
 
   remove_path
+  # rm -rf の後は _log() を呼ぶ info/warn/error を使わない。
+  # _log() が mkdir -p "${LOG_DIR}" するため、rm -rf 後に呼ぶと
+  # ~/.nmux/logs/ が再生成される。
   rm -rf "${NMUX_DIR}"
-  info "${NMUX_DIR} を削除しました"
+  printf '%b[nmux]%b %s を削除しました\n' "${GREEN}" "${NC}" "${NMUX_DIR}"
 
   printf '\n%b%bnmux をアンインストールしました。%b\n' "${GREEN}" "${BOLD}" "${NC}"
   printf '  シェルを再起動してください。\n\n'

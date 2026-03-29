@@ -256,6 +256,15 @@ cmd_name() {
   local label="$2"
   local pid
   pid=$(resolve_target "${target}")
+  # session:window.pane 形式を pane_id (%N 形式) に正規化する。
+  # resolve_target は session:window.pane をそのまま返す場合があり、
+  # label ファイルに保存する際は #{pane_id} 形式でなければ resolve_target の
+  # 照合（tmux list-panes -F '#{pane_id}'）が失敗するため変換が必要。
+  local actual_id
+  actual_id=$(tmux display-message -t "${pid}" -p '#{pane_id}' 2>/dev/null || true)
+  if [ -n "${actual_id}" ]; then
+    pid="${actual_id}"
+  fi
   _state_init
 
   printf '%s\n' "${pid}" > "$(_label_file "${label}")"
