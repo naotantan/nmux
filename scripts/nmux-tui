@@ -137,6 +137,26 @@ class NmuxTUI:
             return int(manual)
         return _INTERVAL_SMALL if len(self.panes) <= 20 else _INTERVAL_LARGE
 
+    # ── ペイン行データ構築（curses 非依存・単体テスト可） ────
+    def _build_pane_rows(self, col_widths):
+        """ペインごとの表示文字列を返す。curses に依存しない純粋メソッド。
+
+        Returns:
+            list of dict: {target, label, process, last, offline}
+        """
+        rows = []
+        for pane in self.panes:
+            last    = _truncate(_get_last_line(pane.get("pane_id", "")),
+                                col_widths["out"])
+            rows.append({
+                "target":  _truncate(pane.get("target",  ""), col_widths["target"]),
+                "label":   _truncate(pane.get("label",   ""), col_widths["label"]),
+                "process": _truncate(pane.get("process", ""), col_widths["process"]),
+                "last":    last,
+                "offline": "OFFLINE" in last or "✗" in last,
+            })
+        return rows
+
     # ── 画面描画 ─────────────────────────────────────────────
     def _draw(self):
         self.scr.clear()
@@ -178,32 +198,29 @@ class NmuxTUI:
         line = "─" * min(max_x, col_w["target"] + col_w["label"] + col_w["process"] + out_w + 3)
         _safe_addstr(self.scr, 2, 0, line, curses.color_pair(_C_BORDER))
 
-        # ── ペイン行 ─────────────────────────────────────────
-        for idx, pane in enumerate(self.panes):
+        # ── ペイン行（_build_pane_rows で構築したデータを描画） ─
+        col_widths = {"target": col_w["target"], "label": col_w["label"],
+                      "process": col_w["process"], "out": out_w}
+        pane_rows = self._build_pane_rows(col_widths)
+        for idx, prow in enumerate(pane_rows):
             row = idx + 3
             if row >= max_y - 2:
                 break
 
-            target  = _truncate(pane.get("target",  ""), col_w["target"])
-            label   = _truncate(pane.get("label",   ""), col_w["label"])
-            process = _truncate(pane.get("process", ""), col_w["process"])
-            last    = _truncate(_get_last_line(pane.get("pane_id", "")), out_w)
-            offline = "OFFLINE" in last or "✗" in last
-
             attr = curses.A_REVERSE if idx == self.cursor else 0
             _safe_addstr(self.scr, row, 0,
-                "{:<{}}".format(target,  col_w["target"])[:max_x], attr)
+                "{:<{}}".format(prow["target"],  col_w["target"])[:max_x], attr)
             col = col_w["target"] + 1
             _safe_addstr(self.scr, row, col,
-                "{:<{}}".format(label, col_w["label"])[:max(0, max_x - col)],
+                "{:<{}}".format(prow["label"], col_w["label"])[:max(0, max_x - col)],
                 attr | curses.color_pair(_C_LABEL))
             col += col_w["label"] + 1
             _safe_addstr(self.scr, row, col,
-                "{:<{}}".format(process, col_w["process"])[:max(0, max_x - col)], attr)
+                "{:<{}}".format(prow["process"], col_w["process"])[:max(0, max_x - col)], attr)
             col += col_w["process"] + 1
-            out_attr = curses.color_pair(_C_OFFLINE) if offline else curses.color_pair(_C_ONLINE)
+            out_attr = curses.color_pair(_C_OFFLINE) if prow["offline"] else curses.color_pair(_C_ONLINE)
             _safe_addstr(self.scr, row, col,
-                "{:<{}}".format(last, out_w)[:max(0, max_x - col)],
+                "{:<{}}".format(prow["last"], out_w)[:max(0, max_x - col)],
                 attr | out_attr)
 
         # ── フッター（キー一覧） ────────────────────────────
