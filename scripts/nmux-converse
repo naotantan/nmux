@@ -304,6 +304,11 @@ _run_loop() {
   log_f=$(_lf "${name}"); pid_f=$(_pf "${name}")
   printf '%d\n' "$$" > "${pid_f}"
 
+  # Feature A: skill-map をロード
+  _SKILL_MAP_LOADED=0
+  _SKILL_MAP_FILE=""
+  _skill_map_load
+
   # Ctrl+C / TERM で正常終了（#5: 可読性向上のため専用関数に抽出）
   _on_exit() {
     _info "会話を中断しました"
@@ -347,6 +352,14 @@ _run_loop() {
     _sep
     printf "${CYAN}${BOLD}[Turn %d/%d]${NC}  → ${BOLD}%s${NC}\n" \
       "${turn}" "${max_turns}" "${current_agent}"
+    # Feature A: スキル検出・表示
+    local _detected_skill
+    _detected_skill=$(_skill_detect "${current_msg}" || true)
+    _skill_show "${_detected_skill}"
+    # スキル未インストールかつ検出済みならダイアログ表示
+    if [ -n "${_detected_skill}" ] && ! _skill_installed "${_detected_skill}"; then
+      _prompt_create_skill "${_detected_skill}"
+    fi
     printf "${YELLOW}▶${NC} %s\n\n" "${current_msg}"
 
     # ログ記録
