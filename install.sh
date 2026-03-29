@@ -472,6 +472,11 @@ install_core() {
     warn "インストール後に手動で追加する場合: brew install python3 (macOS) または apt-get install python3 (Linux)"
   fi
 
+  # nmux-converse（bash スクリプト・常時インストール）
+  info "nmux-converse をインストール中..."
+  download "${BASE_URL}/scripts/nmux-converse" "${BIN_DIR}/nmux-converse"
+  chmod +x "${BIN_DIR}/nmux-converse"
+
   # nmux CLI 本体
   info "nmux CLI をインストール中..."
   download "${BASE_URL}/install.sh" "${BIN_DIR}/nmux"
@@ -605,6 +610,10 @@ cmd_update() {
     download "${BASE_URL}/scripts/nmux-tui"      "${BIN_DIR}/nmux-tui"
     chmod +x "${BIN_DIR}/nmux-tui"
   fi
+
+  # nmux-converse（bash スクリプト・常時インストール）
+  download "${BASE_URL}/scripts/nmux-converse" "${BIN_DIR}/nmux-converse"
+  chmod +x "${BIN_DIR}/nmux-converse"
 
   download "${BASE_URL}/install.sh" "${BIN_DIR}/nmux"
   chmod +x "${BIN_DIR}/nmux"
@@ -802,6 +811,7 @@ nmux — multi-agent tmux setup (macOS / Ubuntu)
   heartbeat <subcmd>   ハートビート管理 (start/stop/status)
   api [start|stop|status]  REST API サーバー管理（daemon モード用）
   tui                  TUI ダッシュボードを起動
+  converse [opts]      AI-to-AI リアルタイム会話（エージェント間の自動対話）
   verify <file> <sha>  ファイルの sha256 を検証
   log [N]              直近 N 行のログを表示
   version              バージョン表示
@@ -836,6 +846,7 @@ case "${1:-install}" in
   heartbeat)          shift; cmd_heartbeat "$@" ;;
   api)                shift; "${BIN_DIR}/nmux-api" "${1:-status}" ;;
   tui)                "${BIN_DIR}/nmux-tui" ;;
+  converse)           shift; "${BIN_DIR}/nmux-converse" "$@" ;;
   verify)             cmd_verify "${2:-}" "${3:-}" ;;
   log)                cmd_log "${2:-50}" ;;
   version|--version|-v|-V) cmd_version ;;

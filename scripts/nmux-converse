@@ -1,0 +1,474 @@
+#!/usr/bin/env bash
+# nmux-converse — AI-to-AI リアルタイム会話オーケストレーター
+# ローカルエージェント:          label
+# リモートエージェント:          [user@]host[:port]/label
+# https://github.com/naotantan/nmux
+set -euo pipefail
+
+NMUX_DIR="${HOME}/.nmux"
+CONVERSE_DIR="${NMUX_DIR}/state/converse"
+LOG_DIR="${NMUX_DIR}/logs"
+BRIDGE="${NMUX_DIR}/bin/nmux-bridge"
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+
+_ts()   { date '+%Y-%m-%dT%H:%M:%S'; }
+_info() { printf "${GREEN}[converse]${NC} %s\n" "$*"; }
+_warn() { printf "${YELLOW}[converse]${NC} %s\n" "$*" >&2; }
+_err()  { printf "${RED}[converse] error:${NC} %s\n" "$*" >&2; exit 1; }
+_dbg()  { [ "${NMUX_DEBUG:-}" = "1" ] && printf "${BLUE}[converse:dbg]${NC} %s\n" "$*" >&2 || true; }
+_sep()  { printf "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"; }
+_flog() { mkdir -p "${LOG_DIR}"; printf '%s [converse] %s\n' "$(_ts)" "$*" >> "${LOG_DIR}/converse-$(date +%Y%m%d).log" 2>/dev/null || true; }
+
+# ── セッションファイルのパス ─────────────────────────────────
+_sf()  { printf '%s/%s.conf' "${CONVERSE_DIR}" "$1"; }
+_lf()  { printf '%s/%s.log'  "${CONVERSE_DIR}" "$1"; }
+_pf()  { printf '%s/%s.pid'  "${CONVERSE_DIR}" "$1"; }
+
+# ── エージェント書式の解析 ───────────────────────────────────
+# 入力: label  /  [user@]host[:port]/label
+# 出力: グローバル変数 _AG_LABEL / _AG_HOST / _AG_USER / _AG_PORT
+_parse_agent() {
+  local agent="$1"
+  _AG_LABEL="${agent}"
+  _AG_HOST=""
+  _AG_USER=$(whoami)           # #1: WHOAMI 変数依存を排除し whoami に統一
+  _AG_PORT="${NMUX_SSH_PORT:-22}"
+
+  if printf '%s\n' "${agent}" | grep -q '/'; then
+    local hostpart
+    hostpart="${agent%%/*}"
+    _AG_LABEL="${agent#*/}"
+
+    if printf '%s\n' "${hostpart}" | grep -q '@'; then
+      _AG_USER="${hostpart%@*}"
+      hostpart="${hostpart#*@}"
+    fi
+    if printf '%s\n' "${hostpart}" | grep -q ':'; then
+      _AG_PORT="${hostpart#*:}"
+      _AG_HOST="${hostpart%:*}"
+    else
+      _AG_HOST="${hostpart}"
+    fi
+  fi
+}
+
+# ── nmux-bridge のラッパー ───────────────────────────────────
+# 使い方: _bridge <agent> <command> [args...]
+# NMUX_DEBUG=1 の場合は SSH エラーを stderr に出力する（#2）
+_bridge() {
+  local agent="$1" cmd="$2"; shift 2
+  _parse_agent "${agent}"
+  if [ -n "${_AG_HOST}" ]; then
+    _dbg "ssh -p ${_AG_PORT} ${_AG_USER}@${_AG_HOST} nmux-bridge ${cmd} ${_AG_LABEL} $*"
+    if [ "${NMUX_DEBUG:-}" = "1" ]; then
+      ssh -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
+        -p "${_AG_PORT}" "${_AG_USER}@${_AG_HOST}" \
+        "~/.nmux/bin/nmux-bridge ${cmd} ${_AG_LABEL} $*"
+    else
+      ssh -q -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new \
+        -p "${_AG_PORT}" "${_AG_USER}@${_AG_HOST}" \
+        "~/.nmux/bin/nmux-bridge ${cmd} ${_AG_LABEL} $*" 2>/dev/null
+    fi
+  else
+    "${BRIDGE}" "${cmd}" "${_AG_LABEL}" "$@" 2>/dev/null
+  fi
+}
+
+# ── エージェントの存在確認 ──────────────────────────────────
+_agent_exists() {
+  local agent="$1"
+  _parse_agent "${agent}"
+  if [ -n "${_AG_HOST}" ]; then
+    ssh -q -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
+      -p "${_AG_PORT}" "${_AG_USER}@${_AG_HOST}" \
+      "~/.nmux/bin/nmux-bridge list --json 2>/dev/null | grep -q '\"label\":\"${_AG_LABEL}\"'" 2>/dev/null
+  else
+    "${BRIDGE}" list --json 2>/dev/null | grep -q "\"label\":\"${_AG_LABEL}\""
+  fi
+}
+
+# ── 応答抽出: 送信メッセージ以降、最後のプロンプト行を除く ──
+# #3: tmpfile を使わずパイプで処理（軽量化）
+# #3: 同一メッセージが複数回出現する場合、最後のマッチ以降を使用する
+_extract_response() {
+  printf '%s\n' "$1" | awk -v msg="$2" '
+    BEGIN { n=0; last_match=0 }
+    index($0, msg) { last_match=NR; next }
+    { buf[NR]=$0 }
+    END {
+      for (i=last_match+1; i<=NR; i++) {
+        if (i < NR && buf[i] != "") print buf[i]
+      }
+    }
+  '
+}
+
+# ── セッション設定ファイルの一行更新 ───────────────────────
+_conf_set() {
+  local sf="$1" key="$2" val="$3" tmpf
+  tmpf=$(mktemp)
+  grep -v "^${key}=" "${sf}" > "${tmpf}" || true
+  printf '%s="%s"\n' "${key}" "${val}" >> "${tmpf}"
+  mv "${tmpf}" "${sf}"
+}
+
+_get_agents()      { grep '^AGENTS='  "$(_sf "$1")" | cut -d= -f2- | tr -d '"'; }
+_update_status()   { _conf_set "$(_sf "$1")" STATUS "$2" 2>/dev/null || true; }
+
+# ============================================================
+# _run_loop — 会話ループ本体
+# ============================================================
+_run_loop() {
+  # 引数: name turns timeout read_lines prompt interval ssh_port agent1 agent2 ...
+  local name="$1" max_turns="$2" timeout="$3" read_lines="$4"
+  local prompt="$5" interval="$6" ssh_port="$7"
+  shift 7
+  export NMUX_SSH_PORT="${ssh_port}"
+
+  local log_f pid_f
+  log_f=$(_lf "${name}"); pid_f=$(_pf "${name}")
+  printf '%d\n' "$$" > "${pid_f}"
+
+  # Ctrl+C / TERM で正常終了（#5: 可読性向上のため専用関数に抽出）
+  _on_exit() {
+    _info "会話を中断しました"
+    _update_status "${name}" "stopped"
+    rm -f "${pid_f}"
+    exit 0
+  }
+  trap '_on_exit' INT TERM
+
+  # ログヘッダー
+  {
+    printf '# セッション: %s  開始: %s\n' "${name}" "$(_ts)"
+    printf '# エージェント: %s\n\n' "$*"
+  } >> "${log_f}"
+
+  # 初期メッセージをセッションファイルから取得
+  local current_msg
+  current_msg=$(grep '^TOPIC=' "$(_sf "${name}")" | cut -d= -f2- | tr -d '"')
+
+  local turn=0
+
+  while [ "${turn}" -lt "${max_turns}" ]; do
+    # 停止チェック
+    local status
+    status=$(grep '^STATUS=' "$(_sf "${name}")" 2>/dev/null | cut -d= -f2- | tr -d '"' || printf 'running')
+    [ "${status}" = "stopped" ] && break
+
+    # エージェントリストを毎ターン再読込（add/remove を即時反映）
+    local agents_str agent_count
+    agents_str=$(_get_agents "${name}")
+    agent_count=$(printf '%s' "${agents_str}" | wc -w)  # #6: wc -w で正確なカウント
+    [ "${agent_count}" -lt 2 ] && { _warn "エージェントが不足しています（最低2名）"; break; }
+
+    # shellcheck disable=SC2206
+    local agents_arr=(${agents_str})
+    local idx=$(( turn % agent_count ))
+    local current_agent="${agents_arr[${idx}]}"
+
+    turn=$(( turn + 1 ))
+
+    _sep
+    printf "${CYAN}${BOLD}[Turn %d/%d]${NC}  → ${BOLD}%s${NC}\n" \
+      "${turn}" "${max_turns}" "${current_agent}"
+    printf "${YELLOW}▶${NC} %s\n\n" "${current_msg}"
+
+    # ログ記録
+    printf '[Turn %d] %s  to: %s\n%s\n\n' \
+      "${turn}" "$(_ts)" "${current_agent}" "${current_msg}" >> "${log_f}"
+
+    # エージェント存在確認
+    if ! _agent_exists "${current_agent}" 2>/dev/null; then
+      _warn "'${current_agent}' が見つかりません（nmux-bridge name で登録確認）"
+      _flog "WARN: agent not found: ${current_agent}"
+      continue
+    fi
+
+    # 送信: Read Guard → type → Enter
+    _bridge "${current_agent}" read 3 > /dev/null || true
+    _bridge "${current_agent}" type "${current_msg}" \
+      || { _warn "送信失敗: ${current_agent}"; continue; }
+    _bridge "${current_agent}" keys Enter || true
+
+    # 応答待機
+    _info "${current_agent} の応答を待機中... (最大 ${timeout}s)"
+    if ! _bridge "${current_agent}" wait "${prompt}" "${timeout}" 2>/dev/null; then
+      _warn "${current_agent} タイムアウト (${timeout}s)"
+      current_msg="[タイムアウト: ${current_agent} 応答なし]"
+      printf '[Turn %d] TIMEOUT: %s\n\n' "${turn}" "${current_agent}" >> "${log_f}"
+      continue
+    fi
+
+    # 応答取得・抽出
+    local raw response
+    raw=$(_bridge "${current_agent}" read "${read_lines}" || true)
+    response=$(_extract_response "${raw}" "${current_msg}")
+
+    # 抽出結果が空なら生データを使用
+    if [ -z "$(printf '%s' "${response}" | tr -d '[:space:]')" ]; then
+      response="${raw}"
+    fi
+
+    printf "${BLUE}[%s]${NC}\n%s\n" "${current_agent}" "${response}"
+    printf '[%s]\n%s\n\n' "${current_agent}" "${response}" >> "${log_f}"
+
+    current_msg="${response}"
+    sleep "${interval}"
+  done
+
+  _sep
+  _info "完了: ${turn} ターン"
+  _update_status "${name}" "completed"
+  rm -f "${pid_f}"
+}
+
+# ============================================================
+# cmd_start
+# ============================================================
+cmd_start() {
+  local name="" turns=10 timeout=120 read_lines=80
+  local prompt='[$%#>❯]' interval=1 daemon=0 message="" ssh_port=22
+  local agents=()
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -n|--name)       name="$2";        shift 2 ;;
+      -t|--turns)      turns="$2";       shift 2 ;;
+      --timeout)       timeout="$2";     shift 2 ;;
+      --lines)         read_lines="$2";  shift 2 ;;
+      --prompt)        prompt="$2";      shift 2 ;;
+      --interval)      interval="$2";    shift 2 ;;
+      --ssh-port)      ssh_port="$2";    shift 2 ;;
+      --daemon)        daemon=1;         shift ;;
+      -m|--message)    message="$2";     shift 2 ;;
+      -*)              _err "不明なオプション: $1" ;;
+      *)               agents+=("$1");   shift ;;
+    esac
+  done
+
+  # -m 未指定時は最後の位置引数をメッセージとして使用
+  if [ -z "${message}" ] && [ ${#agents[@]} -gt 0 ]; then
+    message="${agents[$(( ${#agents[@]} - 1 ))]}"
+    agents=("${agents[@]:0:$(( ${#agents[@]} - 1 ))}")
+  fi
+
+  [ ${#agents[@]} -lt 2 ] && \
+    _err "エージェントを2つ以上指定してください\n  例: nmux-converse agent-a agent-b \"テーマ\""
+  [ -z "${message}" ] && \
+    _err "トピックを指定してください: -m \"<テーマ>\""
+
+  [ -z "${name}" ] && name="sess-$(date +%H%M%S)"
+
+  mkdir -p "${CONVERSE_DIR}"
+  local sf pid_f log_f
+  sf=$(_sf "${name}"); pid_f=$(_pf "${name}"); log_f=$(_lf "${name}")
+
+  # 既存セッション確認
+  if [ -f "${pid_f}" ] && kill -0 "$(cat "${pid_f}")" 2>/dev/null; then
+    _err "セッション '${name}' は稼働中です。別名で起動: -n <name>"
+  fi
+
+  # セッション設定を保存
+  cat > "${sf}" <<CONF
+NAME="${name}"
+AGENTS="${agents[*]}"
+TURNS="${turns}"
+TIMEOUT="${timeout}"
+READ_LINES="${read_lines}"
+PROMPT="${prompt}"
+INTERVAL="${interval}"
+SSH_PORT="${ssh_port}"
+TOPIC="${message}"
+STATUS="running"
+STARTED="$(_ts)"
+CONF
+
+  _info "セッション '${name}' 開始"
+  _info "エージェント: ${agents[*]}"
+  _info "ターン: ${turns}  タイムアウト: ${timeout}s  SSH ポート: ${ssh_port}"
+  _info "トピック: ${message}"
+  echo ""
+
+  if [ "${daemon}" = "1" ]; then
+    _run_loop "${name}" "${turns}" "${timeout}" "${read_lines}" \
+      "${prompt}" "${interval}" "${ssh_port}" "${agents[@]}" \
+      >> "${log_f}" 2>&1 &
+    printf '%d\n' $! > "${pid_f}"
+    _info "バックグラウンド起動 (PID: $!)"
+    _info "監視: tail -f ${log_f}"
+    _info "停止: nmux-converse stop ${name}"
+  else
+    _run_loop "${name}" "${turns}" "${timeout}" "${read_lines}" \
+      "${prompt}" "${interval}" "${ssh_port}" "${agents[@]}"
+  fi
+}
+
+# ============================================================
+# 管理コマンド群
+# ============================================================
+cmd_stop() {
+  [ $# -eq 0 ] && _err "セッション名を指定してください"
+  local name="$1" pid_f
+  pid_f=$(_pf "${name}")
+  if [ -f "${pid_f}" ]; then
+    local pid; pid=$(cat "${pid_f}")
+    kill -0 "${pid}" 2>/dev/null && kill "${pid}" && _info "停止: PID ${pid}"
+    rm -f "${pid_f}"
+  fi
+  _update_status "${name}" "stopped"
+  _info "セッション '${name}' を停止しました"
+}
+
+cmd_add() {
+  [ $# -lt 2 ] && _err "使い方: nmux-converse add <session> <agent>"
+  local name="$1" agent="$2"
+  local sf; sf=$(_sf "${name}")
+  [ -f "${sf}" ] || _err "セッションが見つかりません: ${name}"
+  local cur; cur=$(_get_agents "${name}")
+  for a in ${cur}; do [ "${a}" = "${agent}" ] && _err "'${agent}' はすでに参加中です"; done
+  _conf_set "${sf}" AGENTS "${cur} ${agent}"
+  _info "'${agent}' を追加しました  現在: ${cur} ${agent}"
+}
+
+cmd_remove() {
+  [ $# -lt 2 ] && _err "使い方: nmux-converse remove <session> <agent>"
+  local name="$1" agent="$2"
+  local sf; sf=$(_sf "${name}")
+  [ -f "${sf}" ] || _err "セッションが見つかりません: ${name}"
+  local cur new=""
+  cur=$(_get_agents "${name}")
+  for a in ${cur}; do [ "${a}" != "${agent}" ] && new="${new} ${a}"; done
+  new="${new# }"
+  local cnt=0; for a in ${new}; do cnt=$(( cnt + 1 )); done
+  [ "${cnt}" -lt 2 ] && _err "最低2エージェント必要です"
+  _conf_set "${sf}" AGENTS "${new}"
+  _info "'${agent}' を削除しました  現在: ${new}"
+}
+
+cmd_list() {
+  # #4: column コマンドで動的列幅調整（長いエージェント名でも見切れない）
+  mkdir -p "${CONVERSE_DIR}"
+  local found=0 rows
+  rows=$(printf "${BOLD}SESSION\tSTATUS\tPORT\tAGENTS${NC}\n")
+  for sf in "${CONVERSE_DIR}"/*.conf; do
+    [ -f "${sf}" ] || continue; found=1
+    local n s a p port live=""
+    n=$(grep '^NAME='     "${sf}" | cut -d= -f2- | tr -d '"')
+    s=$(grep '^STATUS='   "${sf}" | cut -d= -f2- | tr -d '"')
+    a=$(grep '^AGENTS='   "${sf}" | cut -d= -f2- | tr -d '"')
+    port=$(grep '^SSH_PORT=' "${sf}" | cut -d= -f2- | tr -d '"')
+    p=$(_pf "${n}")
+    [ -f "${p}" ] && kill -0 "$(cat "${p}")" 2>/dev/null && live=" ●"
+    rows="${rows}$(printf '%s\t%s\t%s\t%s' "${n}${live}" "${s}" "${port:-22}" "${a}")\n"
+  done
+  if [ "${found}" = "0" ]; then
+    echo "(セッションなし)"
+  else
+    printf '%b' "${rows}" | column -t -s $'\t'
+  fi
+}
+
+cmd_log() {
+  local name="${1:-}" n="${2:-100}"
+  if [ -z "${name}" ]; then
+    local f; f=$(ls -t "${CONVERSE_DIR}"/*.log 2>/dev/null | head -1 || true)
+    [ -z "${f}" ] && _err "ログが見つかりません"
+    tail -n "${n}" "${f}"
+  else
+    local lf; lf=$(_lf "${name}")
+    [ -f "${lf}" ] || _err "ログが見つかりません: ${name}"
+    tail -n "${n}" "${lf}"
+  fi
+}
+
+# ============================================================
+# cmd_help
+# ============================================================
+cmd_help() {
+  cat <<'HELP'
+
+nmux-converse — AI-to-AI リアルタイム会話オーケストレーター
+
+使い方（シンプル）:
+  nmux-converse <agent1> <agent2> [agent3...] "<topic>"
+
+使い方（詳細）:
+  nmux-converse start [opts] <agent1> <agent2> [agent3...] -m "<topic>"
+
+コマンド:
+  start     会話セッションを開始する（デフォルト: フォアグラウンド）
+  stop      セッションを停止する
+  add       実行中セッションにエージェントを追加する（次ターンから反映）
+  remove    実行中セッションからエージェントを削除する（次ターンから反映）
+  list      全セッションを一覧表示（● = 稼働中）
+  log       会話ログを表示する
+
+start オプション:
+  -n, --name <name>      セッション名（デフォルト: sess-HHMMSS）
+  -t, --turns <N>        ターン数（デフォルト: 10）
+  --timeout <sec>        応答タイムアウト秒（デフォルト: 120）
+  --lines <N>            応答読み取り行数（デフォルト: 80）
+  --prompt <pattern>     プロンプト検出パターン（デフォルト: [$%#>❯]）
+  --interval <sec>       ターン間の待機秒数（デフォルト: 1）
+  --ssh-port <port>      リモートエージェントのデフォルトSSHポート（デフォルト: 22）
+  --daemon               バックグラウンドで実行
+  -m, --message <text>   会話の初期トピック
+
+エージェントの指定:
+  label                  ローカルエージェント（nmux-bridge name で登録済みラベル）
+  host/label             リモートエージェント（SSH ポート 22）
+  host:port/label        リモートエージェント（SSH ポート指定）
+  user@host:port/label   リモートエージェント（ユーザー・ポート指定）
+
+使用例:
+  # ローカル 2 エージェントで 10 ターン（最もシンプルな使い方）
+  nmux-converse agent-a agent-b "AIの未来について議論して"
+
+  # 3 エージェントでラウンドロビン、20 ターン
+  nmux-converse start -n debate -t 20 agent-a agent-b agent-c -m "量子コンピュータの課題"
+
+  # リモートエージェントを含む会話（カスタムSSHポート）
+  nmux-converse agent-a user@sub1:2222/agent-b "設計について議論して"
+
+  # バックグラウンドで実行
+  nmux-converse start --daemon -n bg agent-a agent-b -m "コードレビューして"
+  tail -f ~/.nmux/state/converse/bg.log
+
+  # 実行中にエージェントを追加（次ターンから参加）
+  nmux-converse add debate agent-d
+
+  # 実行中にエージェントを削除（次ターンから除外）
+  nmux-converse remove debate agent-b
+
+  # セッション一覧
+  nmux-converse list
+
+  # ログを確認
+  nmux-converse log debate 50
+
+環境変数:
+  NMUX_SSH_PORT=<port>   デフォルト SSH ポート（--ssh-port より優先度低）
+  NMUX_DEBUG=1           デバッグログ有効化（SSH通信エラーの詳細を表示）
+
+HELP
+}
+
+# ============================================================
+# メイン
+# ============================================================
+[ $# -eq 0 ] && { cmd_help; exit 0; }
+
+case "$1" in
+  start)          shift; cmd_start "$@" ;;
+  stop)           shift; cmd_stop "$@" ;;
+  add)            shift; cmd_add "$@" ;;
+  remove)         shift; cmd_remove "$@" ;;
+  list)                  cmd_list ;;
+  log)            shift; cmd_log "$@" ;;
+  help|--help|-h)        cmd_help ;;
+  # 既知コマンド以外 → start の省略形（agent1 agent2 ... "topic"）
+  *)                     cmd_start "$@" ;;
+esac
