@@ -77,15 +77,22 @@ _bridge() {
 }
 
 # ── エージェントの存在確認 ──────────────────────────────────
+# BUG FIX: set -euo pipefail 環境下で grep -q とパイプを組み合わせると
+# grep がマッチ後に即終了 → SIGPIPE (exit 141) → pipefail で誤判定が発生する。
+# 回避策: 出力を変数に取得してから grep することで SIGPIPE を防ぐ。
 _agent_exists() {
   local agent="$1"
   _parse_agent "${agent}"
   if [ -n "${_AG_HOST}" ]; then
-    ssh -q -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
+    local _remote_json
+    _remote_json=$(ssh -q -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
       -p "${_AG_PORT}" "${_AG_USER}@${_AG_HOST}" \
-      "~/.nmux/bin/nmux-bridge list --json 2>/dev/null | grep -q '\"label\":\"${_AG_LABEL}\"'" 2>/dev/null
+      "~/.nmux/bin/nmux-bridge list --json 2>/dev/null" 2>/dev/null) || true
+    printf '%s\n' "${_remote_json}" | grep -q "\"label\":\"${_AG_LABEL}\""
   else
-    "${BRIDGE}" list --json 2>/dev/null | grep -q "\"label\":\"${_AG_LABEL}\""
+    local _local_json
+    _local_json=$("${BRIDGE}" list --json 2>/dev/null) || true
+    printf '%s\n' "${_local_json}" | grep -q "\"label\":\"${_AG_LABEL}\""
   fi
 }
 
@@ -373,13 +380,25 @@ cmd_list() {
 
 cmd_log() {
   local name="${1:-}" n="${2:-100}"
+  # 第1引数が数字のみ → 行数として最新ログに適用（例: log 50 = 最新ログの最終50行）
+  if [ -n "${name}" ] && printf '%s' "${name}" | grep -qE '^[0-9]+$'; then
+    n="${name}"
+    name=""
+  fi
   if [ -z "${name}" ]; then
     local f; f=$(ls -t "${CONVERSE_DIR}"/*.log 2>/dev/null | head -1 || true)
-    [ -z "${f}" ] && _err "ログが見つかりません"
+    if [ -z "${f}" ]; then
+      _warn "ログが見つかりません。セッション一覧: nmux-converse list"
+      return 1
+    fi
     tail -n "${n}" "${f}"
   else
     local lf; lf=$(_lf "${name}")
-    [ -f "${lf}" ] || _err "ログが見つかりません: ${name}"
+    if [ ! -f "${lf}" ]; then
+      _warn "ログが見つかりません: ${name}"
+      _warn "セッション一覧: nmux-converse list"
+      return 1
+    fi
     tail -n "${n}" "${lf}"
   fi
 }
@@ -394,6 +413,9 @@ nmux-converse — AI-to-AI リアルタイム会話オーケストレーター
 
 使い方（シンプル）:
   nmux-converse <agent1> <agent2> [agent3...] "<topic>"
+
+使い方（nmux CLI 経由）:
+  nmux converse <agent1> <agent2> [agent3...] "<topic>"
 
 使い方（詳細）:
   nmux-converse start [opts] <agent1> <agent2> [agent3...] -m "<topic>"
