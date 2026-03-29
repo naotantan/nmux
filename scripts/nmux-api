@@ -1,0 +1,420 @@
+#!/usr/bin/env python3
+# nmux-api — HTTP REST API server for nmux-bridge
+# Python 3.6+ / 標準ライブラリのみ
+# https://github.com/naotantan/nmux
+import json
+import os
+import re
+import signal
+import socketserver
+import subprocess
+import sys
+import tempfile
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import parse_qs, urlparse
+
+# ── 定数 ──────────────────────────────────────────────────────
+VERSION   = "2.0.0"
+NMUX_DIR  = os.path.join(os.environ.get("HOME", ""), ".nmux")
+BIN_DIR   = os.path.join(NMUX_DIR, "bin")
+STATE_DIR = os.path.join(NMUX_DIR, "state")
+LOG_DIR   = os.path.join(NMUX_DIR, "logs")
+PID_FILE  = os.path.join(STATE_DIR, "api.pid")
+BRIDGE    = os.path.join(BIN_DIR, "nmux-bridge")
+DISPATCH  = os.path.join(BIN_DIR, "nmux-dispatch")
+
+# ── Python 3.6 互換: ThreadingHTTPServer ──────────────────────
+class _ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+    """複数リクエストを並列処理するスレッドプールHTTPサーバー"""
+    daemon_threads = True
+
+
+# ── 設定読み込み（nmux.conf + 環境変数） ────────────────────────
+_CONF_KEYS = ("NMUX_API_HOST", "NMUX_API_PORT", "NMUX_API_TOKEN", "NMUX_API_MODE")
+
+def _load_conf() -> dict:
+    conf = {
+        "NMUX_API_HOST":  "127.0.0.1",
+        "NMUX_API_PORT":  "8765",
+        "NMUX_API_TOKEN": "",
+        "NMUX_API_MODE":  "integrated",
+    }
+    conf_file = os.path.join(NMUX_DIR, "nmux.conf")
+    if os.path.isfile(conf_file):
+        with open(conf_file, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                k = k.strip()
+                v = v.strip().strip('"').strip("'")
+                if k in conf:
+                    conf[k] = v
+    # 環境変数で上書き
+    for k in _CONF_KEYS:
+        val = os.environ.get(k, "")
+        if val:
+            conf[k] = val
+    return conf
+
+
+CONF  = _load_conf()
+HOST  = CONF["NMUX_API_HOST"]
+PORT  = int(CONF["NMUX_API_PORT"])
+TOKEN = CONF["NMUX_API_TOKEN"]
+MODE  = CONF["NMUX_API_MODE"]
+
+# ── カラー出力 ────────────────────────────────────────────────
+GREEN  = "\033[0;32m"
+RED    = "\033[0;31m"
+YELLOW = "\033[0;33m"
+NC     = "\033[0m"
+
+def _info(msg):  print("{0}[nmux-api]{1} {2}".format(GREEN, NC, msg), flush=True)
+def _warn(msg):  print("{0}warn:{1} {2}".format(YELLOW, NC, msg), file=sys.stderr, flush=True)
+def _error(msg): print("{0}[nmux-api] error:{1} {2}".format(RED, NC, msg), file=sys.stderr, flush=True)
+
+
+# ── nmux-bridge サブプロセス呼び出し ─────────────────────────
+def _bridge(args, timeout=30):
+    """nmux-bridge を実行し CompletedProcess を返す。"""
+    return subprocess.run(
+        [BRIDGE] + list(args),
+        capture_output=True, text=True, timeout=timeout
+    )
+
+def _bridge_out(args, timeout=30):
+    """成功なら stdout 文字列を返す。失敗なら RuntimeError を送出。"""
+    r = _bridge(args, timeout)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or "nmux-bridge exit {}".format(r.returncode))
+    return r.stdout
+
+
+# ── リクエストハンドラ ─────────────────────────────────────────
+class _Handler(BaseHTTPRequestHandler):
+    """nmux REST API リクエストハンドラ"""
+
+    # アクセスログを抑制（NMUX_DEBUG=1 で有効化）
+    def log_message(self, fmt, *args):
+        if os.environ.get("NMUX_DEBUG") == "1":
+            print("[nmux-api] {} {}".format(self.address_string(), fmt % args), flush=True)
+
+    # ── 認証 ────────────────────────────────────────────────
+    def _auth_ok(self):
+        if not TOKEN:
+            return True
+        return self.headers.get("Authorization", "") == "Bearer {}".format(TOKEN)
+
+    # ── JSON レスポンス送信 ──────────────────────────────────
+    def _send(self, code, body):
+        payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _ok(self, data=None):
+        merged = {"ok": True}
+        if data:
+            merged.update(data)
+        self._send(200, merged)
+
+    def _err(self, code, msg):
+        self._send(code, {"ok": False, "error": msg})
+
+    # ── リクエストボディ読み込み ────────────────────────────
+    def _body(self):
+        length = int(self.headers.get("Content-Length", 0))
+        if length == 0:
+            return {}
+        raw = self.rfile.read(length)
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return {}
+
+    # ── HTTP メソッドディスパッチ ───────────────────────────
+    def do_GET(self):   self._route("GET")
+    def do_POST(self):  self._route("POST")
+
+    def _route(self, method):
+        if not self._auth_ok():
+            self._err(401, "Unauthorized")
+            return
+
+        parsed = urlparse(self.path)
+        path   = parsed.path.rstrip("/")
+        qs     = parse_qs(parsed.query)
+
+        try:
+            self._dispatch(method, path, qs)
+        except Exception as exc:
+            self._err(500, str(exc))
+
+    def _dispatch(self, method, path, qs):
+        # GET /status
+        if method == "GET" and path == "/status":
+            try:
+                out   = _bridge_out(["list", "--json"])
+                panes = json.loads(out) if out.strip() else []
+                count = len(panes)
+            except Exception:
+                count = -1
+            self._ok({
+                "version":    VERSION,
+                "mode":       MODE,
+                "host":       HOST,
+                "port":       PORT,
+                "auth":       bool(TOKEN),
+                "pane_count": count,
+            })
+            return
+
+        # GET /panes
+        if method == "GET" and path == "/panes":
+            out   = _bridge_out(["list", "--json"])
+            panes = json.loads(out) if out.strip() else []
+            self._ok({"panes": panes})
+            return
+
+        # GET /panes/{target}/read
+        if method == "GET" and path.startswith("/panes/") and path.endswith("/read"):
+            target = path[len("/panes/"):-len("/read")]
+            lines  = qs.get("lines", ["50"])[0]
+            out = _bridge_out(["read", target, lines])
+            self._ok({"content": out})
+            return
+
+        # POST /panes/{target}/type
+        if method == "POST" and path.startswith("/panes/") and path.endswith("/type"):
+            target = path[len("/panes/"):-len("/type")]
+            body   = self._body()
+            text   = body.get("text", "")
+            if not text:
+                self._err(400, "'text' は必須です")
+                return
+            _bridge_out(["read", target, "1"])          # Read Guard
+            _bridge_out(["type", target, text])
+            self._ok({"pane": target})
+            return
+
+        # POST /panes/{target}/message
+        if method == "POST" and path.startswith("/panes/") and path.endswith("/message"):
+            target = path[len("/panes/"):-len("/message")]
+            body   = self._body()
+            text   = body.get("text", "")
+            if not text:
+                self._err(400, "'text' は必須です")
+                return
+            _bridge_out(["read", target, "1"])          # Read Guard
+            _bridge_out(["message", target, text])
+            self._ok({"pane": target})
+            return
+
+        # POST /panes/{target}/wait
+        if method == "POST" and path.startswith("/panes/") and path.endswith("/wait"):
+            target  = path[len("/panes/"):-len("/wait")]
+            body    = self._body()
+            pattern = body.get("pattern", r"[$]")
+            timeout = int(body.get("timeout", 30))
+            r = _bridge(["wait", target, pattern, str(timeout)], timeout=timeout + 10)
+            if r.returncode == 0:
+                elapsed = 0
+                m = re.search(r'(\d+)秒後', r.stdout)
+                if m:
+                    elapsed = int(m.group(1))
+                self._ok({"matched": pattern, "elapsed": elapsed})
+            else:
+                self._err(504, r.stderr.strip() or "タイムアウト")
+            return
+
+        # POST /dispatch
+        if method == "POST" and path == "/dispatch":
+            body = self._body()
+            if "tasks" not in body:
+                self._err(400, "'tasks' は必須です")
+                return
+            default_timeout = int(
+                body.get("defaults", {}).get("timeout", 120)
+            )
+            total_timeout = default_timeout * len(body["tasks"]) + 30
+
+            tf_path = ""
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", suffix=".json",
+                    delete=False, encoding="utf-8"
+                ) as tf:
+                    json.dump(body, tf, ensure_ascii=False)
+                    tf_path = tf.name
+
+                r = subprocess.run(
+                    [DISPATCH, tf_path],
+                    capture_output=True, text=True,
+                    timeout=total_timeout
+                )
+                self._ok({
+                    "task_count": len(body["tasks"]),
+                    "exit_code":  r.returncode,
+                    "output":     r.stdout[-2000:],
+                })
+            finally:
+                if tf_path and os.path.exists(tf_path):
+                    os.unlink(tf_path)
+            return
+
+        self._err(404, "Not found: {} {}".format(method, path))
+
+
+# ── PID ファイル管理 ─────────────────────────────────────────
+def _write_pid():
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+
+def _read_pid():
+    try:
+        with open(PID_FILE) as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return 0
+
+def _remove_pid():
+    try:
+        os.unlink(PID_FILE)
+    except OSError:
+        pass
+
+
+# ── サーバー起動（--serve） ───────────────────────────────────
+def _serve():
+    # 外部公開 + 認証なしの場合に警告
+    if HOST == "0.0.0.0" and not TOKEN:
+        _warn("NMUX_API_HOST=0.0.0.0 で外部公開しています。NMUX_API_TOKEN を必ず設定してください。")
+
+    server = _ThreadingHTTPServer((HOST, PORT), _Handler)
+    _write_pid()
+    _info("起動: http://{}:{}  (auth={}  mode={})".format(
+        HOST, PORT, "on" if TOKEN else "off", MODE
+    ))
+
+    # SIGTERM / SIGINT でクリーンシャットダウン
+    def _shutdown(signum, frame):
+        _info("シャットダウン...")
+        _remove_pid()
+        threading.Thread(target=server.shutdown, daemon=True).start()
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT,  _shutdown)
+
+    try:
+        server.serve_forever()
+    finally:
+        _remove_pid()
+
+
+# ── デーモン制御（start / stop / status） ────────────────────
+def _cmd_start():
+    """バックグラウンドでサーバーを起動する（daemon モード用）。"""
+    pid = _read_pid()
+    if pid:
+        try:
+            os.kill(pid, 0)
+            print("nmux-api は既に起動しています (PID {})".format(pid))
+            return
+        except OSError:
+            _remove_pid()
+
+    os.makedirs(LOG_DIR, exist_ok=True)
+    log_path = os.path.join(LOG_DIR, "api.log")
+    with open(log_path, "a") as log:
+        proc = subprocess.Popen(
+            [sys.executable, __file__, "--serve"],
+            stdout=log, stderr=log,
+            start_new_session=True,
+        )
+    _info("起動しました (PID {})  ログ: {}".format(proc.pid, log_path))
+
+
+def _cmd_stop():
+    pid = _read_pid()
+    if not pid:
+        print("nmux-api は起動していません")
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+        _info("停止シグナルを送信しました (PID {})".format(pid))
+        _remove_pid()
+    except OSError as exc:
+        _error("停止に失敗しました: {}".format(exc))
+        sys.exit(1)
+
+
+def _cmd_status():
+    pid = _read_pid()
+    if pid:
+        try:
+            os.kill(pid, 0)
+            print("nmux-api: 🟢 稼働中 (PID {})  http://{}:{}".format(pid, HOST, PORT))
+            return
+        except OSError:
+            _remove_pid()
+    print("nmux-api: 🔴 停止中")
+
+
+# ── ヘルプ ───────────────────────────────────────────────────
+def _help():
+    print("""
+nmux-api — nmux HTTP REST API サーバー
+
+使い方: nmux-api [--serve | start | stop | status]
+
+サブコマンド:
+  --serve   フォアグラウンドでサーバーを起動（integrated モード / tmux フックから使用）
+  start     バックグラウンドでサーバーを起動（daemon モード）
+  stop      バックグラウンドのサーバーを停止（daemon モード）
+  status    サーバーの稼働状況を確認
+
+エンドポイント:
+  GET  /status                      nmux 全体状態
+  GET  /panes                       ペイン一覧 (JSON)
+  GET  /panes/{target}/read?lines=N ペイン内容取得
+  POST /panes/{target}/type         テキスト入力
+  POST /panes/{target}/message      メッセージ送信
+  POST /panes/{target}/wait         パターン待機
+  POST /dispatch                    タスク分散実行
+
+環境変数:
+  NMUX_API_HOST   バインドアドレス（デフォルト: 127.0.0.1）
+  NMUX_API_PORT   ポート番号（デフォルト: 8765）
+  NMUX_API_TOKEN  Bearer トークン（空の場合は認証なし）
+  NMUX_API_MODE   integrated / daemon（デフォルト: integrated）
+  NMUX_DEBUG=1    アクセスログ有効化
+""")
+
+
+# ── エントリーポイント ─────────────────────────────────────────
+def main():
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "--serve"
+    if cmd == "--serve":
+        _serve()
+    elif cmd == "start":
+        _cmd_start()
+    elif cmd == "stop":
+        _cmd_stop()
+    elif cmd == "status":
+        _cmd_status()
+    elif cmd in ("help", "--help", "-h"):
+        _help()
+    else:
+        _error("不明なコマンド: {}".format(cmd))
+        _help()
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

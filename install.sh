@@ -432,13 +432,37 @@ install_core() {
     chmod +x "${BIN_DIR}/nmux-remote"
   fi
 
-  # nmux-dispatch（Python 3.6+ が必要）
+  # Python スクリプト群（nmux-dispatch / nmux-api / nmux-tui）
+  # Python 3.6+ がなければ全スクリプトをスキップし警告を表示
   if check_python3; then
     info "nmux-dispatch をダウンロード中..."
     download "${BASE_URL}/scripts/nmux-dispatch" "${BIN_DIR}/nmux-dispatch"
     chmod +x "${BIN_DIR}/nmux-dispatch"
+
+    info "nmux-api をダウンロード中..."
+    download "${BASE_URL}/scripts/nmux-api" "${BIN_DIR}/nmux-api"
+    chmod +x "${BIN_DIR}/nmux-api"
+
+    info "nmux-tui をダウンロード中..."
+    download "${BASE_URL}/scripts/nmux-tui" "${BIN_DIR}/nmux-tui"
+    chmod +x "${BIN_DIR}/nmux-tui"
+
+    # API モード選択（インタラクティブインストール時のみ）
+    if [ "${1:-}" != "--sub" ] && [ -t 0 ]; then
+      printf '\n%b? nmux-api の動作モードを選択してください:%b\n' "${YELLOW}" "${NC}"
+      printf '  1) integrated  — tmux セッション連動（推奨・デフォルト）\n'
+      printf '  2) daemon      — 常駐プロセスとして独立起動\n'
+      printf 'モード [1/2, デフォルト: 1]: '
+      read -r api_mode_input
+      case "${api_mode_input}" in
+        2) NMUX_API_MODE="daemon" ;;
+        *) NMUX_API_MODE="integrated" ;;
+      esac
+      # nmux.conf に書き出す（save_conf で反映される）
+      export NMUX_API_MODE
+    fi
   else
-    warn "Python 3.6+ が見つかりません。nmux-dispatch をスキップします。"
+    warn "Python 3.6+ が見つかりません。nmux-dispatch / nmux-api / nmux-tui をスキップします。"
     warn "インストール後に手動で追加する場合: brew install python3 (macOS) または apt-get install python3 (Linux)"
   fi
 
@@ -734,6 +758,8 @@ nmux — multi-agent tmux setup (macOS / Ubuntu)
   uninstall            完全削除（PATH も自動クリーンアップ）
   status               インストール状態を確認
   heartbeat <subcmd>   ハートビート管理 (start/stop/status)
+  api [start|stop|status]  REST API サーバー管理（daemon モード用）
+  tui                  TUI ダッシュボードを起動
   verify <file> <sha>  ファイルの sha256 を検証
   log [N]              直近 N 行のログを表示
   version              バージョン表示
@@ -766,6 +792,8 @@ case "${1:-install}" in
   uninstall|remove)   cmd_uninstall ;;
   status)             cmd_status ;;
   heartbeat)          shift; cmd_heartbeat "$@" ;;
+  api)                shift; "${BIN_DIR}/nmux-api" "${1:-status}" ;;
+  tui)                "${BIN_DIR}/nmux-tui" ;;
   verify)             cmd_verify "${2:-}" "${3:-}" ;;
   log)                cmd_log "${2:-50}" ;;
   version|--version|-v|-V) cmd_version ;;

@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+# nmux-tui — ターミナル UI ダッシュボード for nmux
+# Python 3.6+ / 標準ライブラリのみ（curses 使用）
+# https://github.com/naotantan/nmux
+import curses
+import json
+import os
+import subprocess
+import sys
+import time
+
+# ── 定数 ──────────────────────────────────────────────────────
+NMUX_DIR    = os.path.join(os.environ.get("HOME", ""), ".nmux")
+BIN_DIR     = os.path.join(NMUX_DIR, "bin")
+BRIDGE      = os.path.join(BIN_DIR, "nmux-bridge")
+DISPATCH    = os.path.join(BIN_DIR, "nmux-dispatch")
+STATE_DIR   = os.path.join(NMUX_DIR, "state")
+
+# ペイン数に応じた更新間隔（NMUX_TUI_INTERVAL で手動設定可）
+_INTERVAL_SMALL = 1   # ≤20 ペイン: 1秒
+_INTERVAL_LARGE = 3   # >20 ペイン: 3秒
+
+# カラーペア番号
+_C_HEADER  = 1   # ヘッダー行（青背景）
+_C_BORDER  = 2   # 枠線（シアン）
+_C_ONLINE  = 3   # オンライン（緑）
+_C_OFFLINE = 4   # オフライン（赤）
+_C_LABEL   = 5   # ラベル（黄色）
+_C_KEY     = 6   # キー表示（白太字）
+_C_API_ON  = 7   # API オン（緑）
+_C_API_OFF = 8   # API オフ（赤）
+
+
+# ── ユーティリティ ─────────────────────────────────────────────
+def _truncate(s, width):
+    """文字列を width 文字以内に切り詰める（マルチバイト考慮なし）。"""
+    s = str(s)
+    return s if len(s) <= width else s[:width - 1] + "…"
+
+
+def _safe_addstr(win, y, x, s, attr=0):
+    """curses の範囲外書き込みを無視する addstr ラッパー。"""
+    try:
+        win.addstr(y, x, s, attr)
+    except curses.error:
+        pass
+
+
+# ── データ取得 ─────────────────────────────────────────────────
+def _get_panes():
+    """nmux-bridge list --json でペイン情報を取得する。失敗は空リストを返す。"""
+    try:
+        r = subprocess.run(
+            [BRIDGE, "list", "--json"],
+            capture_output=True, text=True, timeout=3
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return json.loads(r.stdout)
+    except Exception:
+        pass
+    return []
+
+
+def _get_last_line(pane_id):
+    """tmux capture-pane で直近1行を取得する（Read Guard を汚染しない）。"""
+    try:
+        r = subprocess.run(
+            ["tmux", "capture-pane", "-t", pane_id, "-p", "-S", "-1"],
+            capture_output=True, text=True, timeout=2
+        )
+        if r.returncode == 0:
+            lines = [l for l in r.stdout.splitlines() if l.strip()]
+            return lines[-1] if lines else ""
+    except Exception:
+        pass
+    return "✗ OFFLINE"
+
+
+def _check_api():
+    """API サーバーの稼働状況を PID ファイルで確認する。"""
+    pid_file = os.path.join(STATE_DIR, "api.pid")
+    if not os.path.isfile(pid_file):
+        return False, ""
+    try:
+        with open(pid_file) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, 0)   # シグナル 0: 存在確認のみ
+        return True, ""
+    except (OSError, ValueError):
+        pass
+    return False, ""
+
+
+def _get_api_port():
+    """nmux.conf から NMUX_API_PORT を読む。なければデフォルト 8765。"""
+    conf_file = os.path.join(NMUX_DIR, "nmux.conf")
+    if os.path.isfile(conf_file):
+        with open(conf_file, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("NMUX_API_PORT="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return os.environ.get("NMUX_API_PORT", "8765")
+
+
+# ── TUI 本体 ──────────────────────────────────────────────────
+class NmuxTUI:
+    def __init__(self, stdscr):
+        self.scr      = stdscr
+        self.panes    = []
+        self.cursor   = 0       # 選択中の行インデックス
+        self.running  = True
+        self.api_port = _get_api_port()
+
+        # カラー初期化
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(_C_HEADER,  curses.COLOR_WHITE,  curses.COLOR_BLUE)
+        curses.init_pair(_C_BORDER,  curses.COLOR_CYAN,   -1)
+        curses.init_pair(_C_ONLINE,  curses.COLOR_GREEN,  -1)
+        curses.init_pair(_C_OFFLINE, curses.COLOR_RED,    -1)
+        curses.init_pair(_C_LABEL,   curses.COLOR_YELLOW, -1)
+        curses.init_pair(_C_KEY,     curses.COLOR_WHITE,  -1)
+        curses.init_pair(_C_API_ON,  curses.COLOR_GREEN,  -1)
+        curses.init_pair(_C_API_OFF, curses.COLOR_RED,    -1)
+
+        curses.cbreak()
+        curses.noecho()
+        self.scr.keypad(True)
+        self.scr.timeout(100)  # 100ms ごとにキー入力をポーリング
+
+    # ── 更新間隔（ペイン数に基づく） ────────────────────────
+    @property
+    def interval(self):
+        manual = os.environ.get("NMUX_TUI_INTERVAL", "")
+        if manual.isdigit() and int(manual) > 0:
+            return int(manual)
+        return _INTERVAL_SMALL if len(self.panes) <= 20 else _INTERVAL_LARGE
+
+    # ── 画面描画 ─────────────────────────────────────────────
+    def _draw(self):
+        self.scr.clear()
+        max_y, max_x = self.scr.getmaxyx()
+
+        # ── ヘッダー行 ─────────────────────────────────────
+        api_on, _ = _check_api()
+        ts    = time.strftime("%Y-%m-%d %H:%M:%S")
+        api_s = "●  :{}".format(self.api_port) if api_on else "○  (off)"
+        header = " nmux dashboard "
+        meta   = "  {}   api: {}  ".format(ts, api_s)
+        _safe_addstr(self.scr, 0, 0, header, curses.color_pair(_C_HEADER) | curses.A_BOLD)
+        _safe_addstr(self.scr, 0, len(header), meta[:max_x - len(header)],
+                     curses.color_pair(_C_HEADER))
+        # 残幅を埋める
+        fill = max(0, max_x - len(header) - len(meta))
+        _safe_addstr(self.scr, 0, len(header) + len(meta),
+                     " " * fill, curses.color_pair(_C_HEADER))
+
+        # ── カラムヘッダー ──────────────────────────────────
+        col_w = {"target": 14, "label": 10, "process": 10}
+        out_w = max(10, max_x - col_w["target"] - col_w["label"] - col_w["process"] - 4)
+        fmt   = "{:<{}} {:<{}} {:<{}} {:<{}}".format(
+            "TARGET",  col_w["target"],
+            "LABEL",   col_w["label"],
+            "PROCESS", col_w["process"],
+            "LAST OUTPUT", out_w,
+        )
+        _safe_addstr(self.scr, 1, 0, fmt[:max_x], curses.A_BOLD)
+
+        # 区切り線
+        line = "─" * min(max_x, col_w["target"] + col_w["label"] + col_w["process"] + out_w + 3)
+        _safe_addstr(self.scr, 2, 0, line, curses.color_pair(_C_BORDER))
+
+        # ── ペイン行 ─────────────────────────────────────────
+        for idx, pane in enumerate(self.panes):
+            row = idx + 3
+            if row >= max_y - 2:
+                break
+
+            target  = _truncate(pane.get("target",  ""), col_w["target"])
+            label   = _truncate(pane.get("label",   ""), col_w["label"])
+            process = _truncate(pane.get("process", ""), col_w["process"])
+            last    = _truncate(_get_last_line(pane.get("pane_id", "")), out_w)
+            offline = "OFFLINE" in last or "✗" in last
+
+            attr = curses.A_REVERSE if idx == self.cursor else 0
+            _safe_addstr(self.scr, row, 0,
+                "{:<{}}".format(target,  col_w["target"])[:max_x], attr)
+            col = col_w["target"] + 1
+            _safe_addstr(self.scr, row, col,
+                "{:<{}}".format(label, col_w["label"])[:max(0, max_x - col)],
+                attr | curses.color_pair(_C_LABEL))
+            col += col_w["label"] + 1
+            _safe_addstr(self.scr, row, col,
+                "{:<{}}".format(process, col_w["process"])[:max(0, max_x - col)], attr)
+            col += col_w["process"] + 1
+            out_attr = curses.color_pair(_C_OFFLINE) if offline else curses.color_pair(_C_ONLINE)
+            _safe_addstr(self.scr, row, col,
+                "{:<{}}".format(last, out_w)[:max(0, max_x - col)],
+                attr | out_attr)
+
+        # ── フッター（キー一覧） ────────────────────────────
+        footer_y = max_y - 1
+        keys = "  [q] 終了  [r] 更新  [Enter] ペイン選択  [d] dispatch  " \
+               "[↑↓] 移動  更新間隔: {}s".format(self.interval)
+        _safe_addstr(self.scr, footer_y, 0,
+            keys[:max_x], curses.color_pair(_C_KEY))
+
+        self.scr.refresh()
+
+    # ── dispatch ファイル指定ダイアログ ──────────────────────
+    def _dispatch_dialog(self):
+        max_y, max_x = self.scr.getmaxyx()
+        prompt = " dispatch: JSON ファイルパスを入力 (ESC でキャンセル): "
+        _safe_addstr(self.scr, max_y - 1, 0, prompt[:max_x], curses.A_REVERSE)
+        self.scr.refresh()
+
+        curses.echo()
+        curses.curs_set(1)
+        buf = ""
+        start_x = min(len(prompt), max_x - 1)
+        while True:
+            try:
+                ch = self.scr.get_wch()
+            except curses.error:
+                continue
+            if ch == 27:          # ESC
+                break
+            if ch in ("\n", "\r", curses.KEY_ENTER, 10):
+                if buf.strip():
+                    self._run_dispatch(buf.strip())
+                break
+            if ch in (curses.KEY_BACKSPACE, 127, "\x7f"):
+                buf = buf[:-1]
+            elif isinstance(ch, str) and ch.isprintable():
+                buf += ch
+            # リアルタイム表示
+            display = (prompt + buf)[:max_x]
+            _safe_addstr(self.scr, max_y - 1, 0, display.ljust(max_x), curses.A_REVERSE)
+            self.scr.refresh()
+
+        curses.noecho()
+        curses.curs_set(0)
+
+    def _run_dispatch(self, path):
+        """nmux-dispatch を実行し、結果をオーバーレイ表示する。"""
+        if not os.path.isfile(path):
+            self._alert("ファイルが見つかりません: {}".format(path), error=True)
+            return
+        try:
+            r = subprocess.run(
+                [DISPATCH, path],
+                capture_output=True, text=True, timeout=300
+            )
+            msg = "dispatch 完了 (exit {})".format(r.returncode)
+        except subprocess.TimeoutExpired:
+            msg = "dispatch タイムアウト"
+        except Exception as exc:
+            msg = "dispatch エラー: {}".format(exc)
+        self._alert(msg, error=(r.returncode != 0) if 'r' in dir() else True)
+
+    def _alert(self, msg, error=False):
+        """画面下部に一時メッセージを表示し、キー入力を待つ。"""
+        max_y, max_x = self.scr.getmaxyx()
+        attr = curses.color_pair(_C_OFFLINE) if error else curses.color_pair(_C_ONLINE)
+        full = "  {}  [任意のキーで閉じる]".format(msg)
+        _safe_addstr(self.scr, max_y - 1, 0, full[:max_x].ljust(max_x), attr)
+        self.scr.refresh()
+        self.scr.timeout(-1)  # ブロッキング待機
+        self.scr.getch()
+        self.scr.timeout(100)
+
+    # ── ペイン選択（Enter） ──────────────────────────────────
+    def _select_pane(self):
+        if not self.panes:
+            return
+        pane = self.panes[self.cursor]
+        target = pane.get("target", "")
+        if not target:
+            return
+        try:
+            subprocess.run(["tmux", "select-pane", "-t", pane.get("pane_id", target)])
+        except Exception:
+            pass
+
+    # ── メインループ ─────────────────────────────────────────
+    def run(self):
+        last_refresh = 0.0
+        curses.curs_set(0)
+
+        while self.running:
+            now = time.time()
+            if now - last_refresh >= self.interval:
+                self.panes    = _get_panes()
+                last_refresh  = now
+                # カーソルを有効範囲に収める
+                if self.panes:
+                    self.cursor = min(self.cursor, len(self.panes) - 1)
+                self._draw()
+
+            try:
+                key = self.scr.getch()
+            except curses.error:
+                continue
+
+            if key == -1:
+                continue
+
+            if key in (ord("q"), ord("Q")):
+                self.running = False
+
+            elif key in (ord("r"), ord("R")):
+                last_refresh = 0  # 次のループで即更新
+
+            elif key in (curses.KEY_UP, ord("k")):
+                if self.cursor > 0:
+                    self.cursor -= 1
+                self._draw()
+
+            elif key in (curses.KEY_DOWN, ord("j")):
+                if self.cursor < len(self.panes) - 1:
+                    self.cursor += 1
+                self._draw()
+
+            elif key in (curses.KEY_ENTER, 10, 13):
+                self._select_pane()
+
+            elif key in (ord("d"), ord("D")):
+                self._dispatch_dialog()
+                last_refresh = 0  # 操作後に即更新
+
+
+# ── エントリーポイント ─────────────────────────────────────────
+def main():
+    try:
+        curses.wrapper(lambda scr: NmuxTUI(scr).run())
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
