@@ -53,6 +53,83 @@ nmux log [N]                    # ログ表示
 nmux version
 ```
 
+## エージェント構成
+
+### 同一マシン（台数制限なし）
+
+tmux ペインを開いた数だけ AI エージェントを並べられます。
+
+```bash
+# 各ペインにラベルを付ける
+nmux-bridge name nmux:1.1 agent-a
+nmux-bridge name nmux:1.2 agent-b
+nmux-bridge name nmux:1.3 agent-c
+
+# 全エージェントを一覧表示
+nmux-bridge list
+```
+
+### 複数マシン（台数制限なし）
+
+`nmux-remote` は `~/.nmux/nmux.conf` の `REMOTE_HOST` で1台のみ管理します。
+2台目以降は SSH 直呼びで操作できます（追加設定不要）。
+
+```bash
+# ~/.ssh/config に登録しておくと便利
+# Host sub1 → 192.168.1.101
+# Host sub2 → 192.168.1.102
+
+ssh sub1 "~/.nmux/bin/nmux-bridge list"
+ssh sub2 "~/.nmux/bin/nmux-bridge list"
+```
+
+### AI-A が AI-B に指示を出す（基本パターン）
+
+```bash
+# 1. AI-B のペイン出力を読む（Read Guard を取得）
+nmux-bridge read agent-b 20
+
+# 2. AI-B にテキストを送信
+nmux-bridge type agent-b "次のタスクを実行してください: ..."
+
+# 3. Enter を送って実行
+nmux-bridge keys agent-b Enter
+
+# 4. AI-B の完了を待つ（プロンプト $ が出るまで最大60秒）
+nmux-bridge wait agent-b '\$' 60
+
+# 5. 結果を読む
+nmux-bridge read agent-b 50
+```
+
+別マシンの AI-C への指示も同じ流れで SSH 経由で実行できます。
+
+```bash
+ssh sub1 "~/.nmux/bin/nmux-bridge read agent-c 20"
+ssh sub1 "~/.nmux/bin/nmux-bridge type agent-c 'タスクを実行してください'"
+ssh sub1 "~/.nmux/bin/nmux-bridge keys agent-c Enter"
+```
+
+### nmux-dispatch で複数エージェントに並列分散
+
+依存関係を定義すると、自動で順序を解決して並列実行します。
+
+```json
+{
+  "tasks": [
+    { "id": "plan",  "agent": "agent-a", "message": "設計してください" },
+    { "id": "impl",  "agent": "agent-b", "message": "実装してください", "depends_on": ["plan"] },
+    { "id": "test",  "agent": "agent-c", "message": "テストしてください", "depends_on": ["impl"] }
+  ]
+}
+```
+
+```bash
+nmux-dispatch tasks.json
+```
+
+---
+
 ## nmux-bridge（ローカルペイン通信）
 
 ```
