@@ -7,7 +7,7 @@ set -euo pipefail
 NMUX_DIR="${HOME}/.nmux"
 LOG_DIR="${NMUX_DIR}/logs"
 STATE_DIR="${NMUX_DIR}/state"
-READ_MARK_TTL=60
+READ_MARK_TTL="${NMUX_READ_MARK_TTL:-60}"
 
 RED='\033[0;31m'
 YELLOW='\033[0;33m'
@@ -106,6 +106,11 @@ _clear_mark() {
 }
 
 cmd_list() {
+  local json=0
+  if [ "${1:-}" = "--json" ]; then
+    json=1
+  fi
+
   _state_init
 
   local label_map
@@ -120,22 +125,37 @@ cmd_list() {
     fi
   done
 
-  printf '\033[1m%-14s %-10s %-20s %-8s %-16s\033[0m\n' \
-    "TARGET" "PANE_ID" "PROCESS" "SIZE" "LABEL"
-  printf '%.0s─' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
-    21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 \
-    41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 \
-    61 62 63 64 65 66 67 68 69 70
-  printf '\n'
-
-  tmux list-panes -a \
-    -F '#{session_name}:#{window_index}.#{pane_index} #{pane_id} #{pane_current_command} #{pane_width}x#{pane_height} #{@name}' \
-    2>/dev/null | while IFS=' ' read -r target pid process size tmux_label; do
-      file_label=$(grep -m1 "^${pid} " "${label_map}" 2>/dev/null | awk '{print $2}' || true)
-      display="${tmux_label:-${file_label:--}}"
-      printf '%-14s %-10s %-20s %-8s %-16s\n' \
-        "${target}" "${pid}" "${process}" "${size}" "${display}"
-    done
+  if [ "${json}" = "1" ]; then
+    # JSON 配列として出力
+    local first=1
+    printf '[\n'
+    tmux list-panes -a \
+      -F '#{session_name}:#{window_index}.#{pane_index} #{pane_id} #{pane_current_command} #{pane_width}x#{pane_height} #{@name}' \
+      2>/dev/null | while IFS=' ' read -r target pid process size tmux_label; do
+        file_label=$(grep -m1 "^${pid} " "${label_map}" 2>/dev/null | awk '{print $2}' || true)
+        label="${tmux_label:-${file_label:-}}"
+        if [ "${first}" = "1" ]; then first=0; else printf ',\n'; fi
+        printf '  {"target":"%s","pane_id":"%s","process":"%s","size":"%s","label":"%s"}' \
+          "${target}" "${pid}" "${process}" "${size}" "${label}"
+      done
+    printf '\n]\n'
+  else
+    printf '\033[1m%-14s %-10s %-20s %-8s %-16s\033[0m\n' \
+      "TARGET" "PANE_ID" "PROCESS" "SIZE" "LABEL"
+    printf '%.0s─' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 \
+      21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 \
+      41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 \
+      61 62 63 64 65 66 67 68 69 70
+    printf '\n'
+    tmux list-panes -a \
+      -F '#{session_name}:#{window_index}.#{pane_index} #{pane_id} #{pane_current_command} #{pane_width}x#{pane_height} #{@name}' \
+      2>/dev/null | while IFS=' ' read -r target pid process size tmux_label; do
+        file_label=$(grep -m1 "^${pid} " "${label_map}" 2>/dev/null | awk '{print $2}' || true)
+        display="${tmux_label:-${file_label:--}}"
+        printf '%-14s %-10s %-20s %-8s %-16s\n' \
+          "${target}" "${pid}" "${process}" "${size}" "${display}"
+      done
+  fi
 
   rm -f "${label_map}"
 }
@@ -299,7 +319,7 @@ nmux-bridge — クロスペイン AI エージェント通信 CLI
 使い方: nmux-bridge <コマンド> [引数...]
 
 コマンド:
-  list                              全ペイン一覧
+  list [--json]                     全ペイン一覧（--json で JSON 配列出力）
   read <target> [lines]             末尾 N 行を読む（デフォルト 50）
   type <target> <text>              テキスト入力（Enter なし）
   keys <target> <key>...            特殊キー送信
@@ -310,6 +330,10 @@ nmux-bridge — クロスペイン AI エージェント通信 CLI
   wait <target> [pattern] [timeout] パターン出現まで待機
   log [N]                           ブリッジログ表示
 
+環境変数:
+  NMUX_DEBUG=1              デバッグログを有効化
+  NMUX_READ_MARK_TTL=<秒>   Read mark の有効期限（デフォルト: 60）
+
 HELP
 }
 
@@ -319,7 +343,7 @@ if [ $# -eq 0 ]; then
 fi
 
 case "$1" in
-  list)                 cmd_list ;;
+  list)     shift;      cmd_list "${1:-}" ;;
   read)    shift;       cmd_read "$@" ;;
   type)    shift;       cmd_type "$@" ;;
   keys)    shift;       cmd_keys "$@" ;;

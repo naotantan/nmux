@@ -46,7 +46,7 @@ check_ssh() {
   _require_host
   if ! ssh -q \
        -o ConnectTimeout=5 \
-       -o StrictHostKeyChecking=no \
+       -o StrictHostKeyChecking=accept-new \
        -o BatchMode=yes \
        -p "${REMOTE_PORT}" \
        "${REMOTE_USER}@${REMOTE_HOST}" \
@@ -59,7 +59,7 @@ check_ssh() {
 remote_run() {
   ssh -q \
     -o ConnectTimeout=10 \
-    -o StrictHostKeyChecking=no \
+    -o StrictHostKeyChecking=accept-new \
     -p "${REMOTE_PORT}" \
     "${REMOTE_USER}@${REMOTE_HOST}" \
     "NMUX_DEBUG=${NMUX_DEBUG:-0} ${REMOTE_BRIDGE} $*"
@@ -168,17 +168,19 @@ cmd_setup() {
 
   if ! ssh -q \
        -o ConnectTimeout=10 \
+       -o StrictHostKeyChecking=accept-new \
        -p "${REMOTE_PORT}" \
        "${REMOTE_USER}@${REMOTE_HOST}" \
        "command -v nmux-bridge >/dev/null 2>&1"; then
     _warn "サブ機に nmux が見つかりません。インストールします..."
-    ssh -p "${REMOTE_PORT}" \
+    ssh -o StrictHostKeyChecking=accept-new -p "${REMOTE_PORT}" \
       "${REMOTE_USER}@${REMOTE_HOST}" \
       "curl -fsSL https://raw.githubusercontent.com/naotantan/nmux/main/install.sh | bash -s -- --sub"
     _info "サブ機へのインストール完了"
   else
     local remote_ver
     remote_ver=$(ssh -q \
+      -o StrictHostKeyChecking=accept-new \
       -p "${REMOTE_PORT}" \
       "${REMOTE_USER}@${REMOTE_HOST}" \
       'cat "${HOME}/.nmux/VERSION" 2>/dev/null || echo 不明')
